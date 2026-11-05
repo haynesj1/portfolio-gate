@@ -1,0 +1,20 @@
+name: test
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+      - run: npm test
+      - name: Generated workflow is up to date
+        run: git diff --exit-code .github/workflows/gate.yml
+      - name: This repo's own caller matches the template
+        run: diff caller/pr-gate.yml .github/workflows/pr-gate.yml

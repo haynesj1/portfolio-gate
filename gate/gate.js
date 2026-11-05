@@ -1,0 +1,156 @@
+// PR gate: classifies risk and decides the `review-gate` commit status.
+// Pure logic only (no network) so it can be unit-tested; the workflow
+// template gathers the data and posts the result.
+//
+// Threat model (decision 0003): agents act with the owner's GitHub identity.
+// They can push, comment, label and post commit statuses as the owner, but
+// not as the GitHub Actions app, and they must not be able to edit workflows.
+// So every piece of evidence the gate trusts is either written by a known
+// reviewer bot and bound to the head SHA, or written by GitHub Actions.
+
+const PROTECTED = [
+  /^\.github\//, /^AGENTS\.md$/, /^CLAUDE\.md$/, /^\.ops\.yml$/, /^\.claude\//,
+  /^specs\//, /^docs\/vision\.md$/, /^docs\/decisions\//,
+];
+const TEST_PATH = [
+  /(^|\/)(tests?|__tests__|e2e|spec)\//, /\.(test|spec)\.[cm]?[jt]sx?$/,
+  /(^|\/)test_[^/]*\.py$/, /_test\.py$/, /(^|\/)src\/(test|androidTest)\//,
+];
+const DOC_PATH = [/\.md$/, /^docs\//];
+const DEPENDENCY_FILES = [
+  /(^|\/)package(-lock)?\.json$/, /(^|\/)pnpm-lock\.yaml$/, /(^|\/)yarn\.lock$/,
+  /(^|\/)uv\.lock$/, /(^|\/)pyproject\.toml$/, /(^|\/)requirements[^/]*\.txt$/,
+  /(^|\/)gradle\/libs\.versions\.toml$/, /(^|\/)build\.gradle(\.kts)?$/,
+];
+// A removed line in a test file that looks like a test or an assertion.
+const REMOVED_TEST_LINE = /^-(?!--).*(\b(it|test|describe)\s*\(|def test_|@Test\b|\bexpect\s*\(|\bassert)/m;
+// An added line that disables or narrows tests.
+const ADDED_SKIP_LINE = /^\+(?!\+\+).*(\.(skip|only|todo)\s*\(|\bx(it|describe)\s*\(|@pytest\.mark\.skip|@Ignore\b|@Disabled\b)/m;
+const BLOCKING_FINDING = /(badge\/P[01]-|\bP[01]\s*Badge)/i;
+// Bot logins whose structured verdicts the gate accepts.
+const CODEX_BOT = 'chatgpt-codex-connector[bot]';
+const VERDICT_BOTS = new Set(['claude[bot]', CODEX_BOT]);
+const ACTIONS_BOT = 'github-actions[bot]';
+
+const isProtected = (f) => PROTECTED.some((r) => r.test(f));
+const isTest = (f) => TEST_PATH.some((r) => r.test(f));
+const isDoc = (f) => DOC_PATH.some((r) => r.test(f));
+const isDependencyFile = (f) => DEPENDENCY_FILES.some((r) => r.test(f));
+
+function classifyFile(file) {
+  const { filename, status, patch = '' } = file;
+  if (isProtected(filename)) return { low: false, why: `protected path ${filename}` };
+  if (isTest(filename)) {
+    if (status === 'removed') return { low: false, why: `test file deleted: ${filename}` };
+    if (REMOVED_TEST_LINE.test(patch)) return { low: false, why: `test or assertion removed in ${filename}` };
+    if (ADDED_SKIP_LINE.test(patch)) return { low: false, why: `test skipped or narrowed in ${filename}` };
+    return { low: true, why: 'tests added' };
+  }
+  if (isDoc(filename) && status !== 'removed') return { low: true, why: 'docs' };
+  return { low: false, why: `code change ${filename}` };
+}
+
+function isPatchBump(title) {
+  const m = /from v?(\d+)\.(\d+)\.(\d+)\S* to v?(\d+)\.(\d+)\.(\d+)/.exec(title || '');
+  return !!m && m[1] === m[4] && m[2] === m[5];
+}
+
+// commits: authors of every commit on the PR (logins), used so that code
+// pushed onto a Dependabot branch by anyone else loses the Dependabot path.
+function classify({ author, title, labels, files, commitAuthors = [] }) {
+  if (files.some((f) => isProtected(f.filename))) {
+    return { risk: 'normal', reasons: files.filter((f) => isProtected(f.filename)).map((f) => `protected path ${f.filename}`) };
+  }
+  if (author === 'dependabot[bot]') {
+    const onlyDependabot = commitAuthors.length > 0 && commitAuthors.every((a) => a === 'dependabot[bot]');
+    const onlyManifests = files.every((f) => isDependencyFile(f.filename));
+    return isPatchBump(title) && onlyDependabot && onlyManifests
+      ? { risk: 'low', reasons: ['dependency patch bump (Dependabot commits, manifests only)'] }
+      : { risk: 'normal', reasons: ['dependency change that is not a pure Dependabot patch bump'] };
+  }
+  if (labels.includes('type:dead-code')) {
+    const onlyDeletes = files.every((f) => f.status !== 'removed' && f.additions === 0);
+    return onlyDeletes
+      ? { risk: 'low', reasons: ['dead-code removal: deletions only, no files removed'] }
+      : { risk: 'normal', reasons: ['dead-code PR adds lines or deletes whole files'] };
+  }
+  const results = files.map(classifyFile);
+  const blockers = results.filter((r) => !r.low).map((r) => r.why);
+  return blockers.length ? { risk: 'normal', reasons: blockers } : { risk: 'low', reasons: [...new Set(results.map((r) => r.why))] };
+}
+
+// Structured verdicts bound to a commit:
+//  - Codex: <!-- codex-review-state:v1 {"code_review":{"commit_sha","status","has_unresolved_findings"}} -->
+//  - Claude reviewer: <!-- review-verdict:v1 {"commit_sha":"…","result":"clear"|"blocking"} -->
+const CODEX_STATE = /<!--\s*codex-review-state:v1\s*(\{[\s\S]*?\})\s*-->/;
+const VERDICT = /<!--\s*review-verdict:v1\s*(\{[\s\S]*?\})\s*-->/;
+const parse = (re, body) => { const m = re.exec(body || ''); if (!m) return null; try { return JSON.parse(m[1]); } catch { return null; } };
+
+// Returns 'clear' | 'blocking' | 'pending' | null (no verdict for this head).
+function verdictFor(item, headSha) {
+  if (!VERDICT_BOTS.has(item.author)) return null;
+  const codex = item.author === CODEX_BOT ? parse(CODEX_STATE, item.body)?.code_review : null;
+  if (codex) {
+    if (codex.commit_sha !== headSha) return null;
+    if (codex.has_unresolved_findings === true) return 'blocking';
+    if (/^(completed|succeeded|success)$/i.test(codex.status || '') && codex.has_unresolved_findings === false) return 'clear';
+    return 'pending';
+  }
+  const v = parse(VERDICT, item.body);
+  if (!v || v.commit_sha !== headSha) return null;
+  if (v.result === 'blocking') return 'blocking';
+  if (v.result === 'clear') return 'clear';
+  return 'pending';
+}
+
+// feedback: comments and reviews ({ author, body, commitId? }). Review and
+// line comments carry commitId; a P0/P1 finding from a reviewer bot on the
+// head commit blocks even if a summary says otherwise.
+function reviewState({ labels, feedback, headSha }) {
+  if (labels.includes('review:blocking')) return 'blocking';
+  // Codex's summary tracks whether its findings are resolved, so it is
+  // authoritative for Codex; raw P0/P1 line findings only count for others.
+  const findings = feedback.filter((x) => VERDICT_BOTS.has(x.author) && x.author !== CODEX_BOT && x.commitId === headSha && BLOCKING_FINDING.test(x.body || ''));
+  const verdicts = feedback.map((x) => verdictFor(x, headSha)).filter(Boolean);
+  if (findings.length || verdicts.includes('blocking')) return 'blocking';
+  if (verdicts.includes('pending')) return 'missing';
+  return verdicts.includes('clear') ? 'clear' : 'missing';
+}
+
+// Approval: the latest `labeled` event for human-approved must be by the
+// owner, done directly (not via a GitHub App such as an agent), and later than
+// both (a) when THIS PR adopted its head commit, i.e. the earliest pr-gate run
+// GitHub recorded for this PR and head SHA (run records can't be forged, and
+// unlike commit statuses they are tied to the PR), and (b) the latest force
+// push. Any new push needs a new approval; re-adding the label after a force
+// push restores it.
+function ownerLabelled(name, { labels, labelEvents, owner, headAdoptedAt, forcePushTimes = [] }) {
+  if (!labels.includes(name) || !headAdoptedAt) return false;
+  const threshold = [headAdoptedAt, ...forcePushTimes].sort().at(-1);
+  const last = labelEvents.filter((e) => e.event === 'labeled' && e.label === name).at(-1);
+  return !!last && last.actor === owner && !last.viaApp && last.at > threshold;
+}
+const humanApproved = (input) => ownerLabelled('human-approved', input);
+// Reviewers can be wrong. The owner can overrule blocking findings for the
+// current commit with `review:override`, under the same rules as approval.
+// It does not replace approval for risk:normal PRs.
+const reviewOverridden = (input) => ownerLabelled('review:override', input);
+
+function decide(input) {
+  const { risk, reasons } = classify(input);
+  const raw = reviewState(input);
+  const overridden = raw === 'blocking' && reviewOverridden(input);
+  const review = overridden ? 'clear' : raw;
+  const approved = humanApproved(input);
+  let state; let description;
+  if (input.draft) { state = 'pending'; description = 'Draft PR'; }
+  else if (review === 'blocking') { state = 'failure'; description = 'Reviewer found P0/P1 issues on this commit (or review:blocking)'; }
+  else if (review === 'missing') { state = 'pending'; description = 'Waiting for a completed review of this commit'; }
+  else if (risk === 'low') { state = 'success'; description = overridden ? 'risk:low; review findings overridden by owner' : 'risk:low and reviewed'; }
+  else if (approved) { state = 'success'; description = overridden ? 'human-approved; review findings overridden by owner' : 'human-approved and reviewed'; }
+  else if (input.labels.includes('human-approved')) { state = 'pending'; description = 'risk:normal: approval predates this commit; remove and re-add human-approved'; }
+  else { state = 'pending'; description = 'risk:normal: waiting for human-approved'; }
+  return { risk, reasons, review, overridden, approved, state, description };
+}
+
+module.exports = { ACTIONS_BOT, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };

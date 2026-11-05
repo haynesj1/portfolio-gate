@@ -1,0 +1,32 @@
+# Calls the shared merge gate in haynesj1/portfolio-gate. Synced from there by
+# portfolio-ops; do not edit in app repos.
+#
+# Only triggers that run the DEFAULT-BRANCH copy of this file are used
+# (pull_request_target, issue_comment), so a PR cannot change the gate that
+# judges it. Reviews are detected through comments: Codex edits its summary
+# comment; the Claude reviewer posts a review-verdict comment.
+name: pr-gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review, converted_to_draft]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+  issues: write
+  statuses: write
+
+concurrency:
+  # One run per PR at a time; a newer run cancels an older one. Every run
+  # recomputes everything from current GitHub state.
+  group: pr-gate-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  evaluate:
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    uses: haynesj1/portfolio-gate/.github/workflows/gate.yml@main

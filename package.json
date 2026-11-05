@@ -1,0 +1,8 @@
+{
+  "name": "portfolio-gate",
+  "private": true,
+  "scripts": {
+    "build": "node gate/build.js",
+    "test": "node gate/build.js && node --test gate/gate.test.js gate/workflow.test.js"
+  }
+}
