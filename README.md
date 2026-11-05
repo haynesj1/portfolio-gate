@@ -26,6 +26,9 @@ Copy [`caller/pr-gate.yml`](caller/pr-gate.yml) to `.github/workflows/pr-gate.ym
 
 ## Develop
 
+Changes here go through this repo's own `review-gate`, so **Codex automatic review must stay on for this repository** (Codex settings → Code review → every push). Without it, gate PRs wait for a review that never comes.
+
+
 ```bash
 npm test   # builds .github/workflows/gate.yml from gate/ and runs unit + workflow-harness tests
 ```
