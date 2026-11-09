@@ -77,31 +77,30 @@ jobs:
               // path, doesn't delete or skip tests, and stays under the size cap.
               // Only the keys below are read, so a tiny parser is enough (no YAML library).
               function parseOpsPolicy(text) {
+                // Allowlist parser: every line must be blank, a comment, a plain top-level
+                // `key: value`, or an item of the policy list being read. Anything else
+                // (quoted or indented keys, nested blocks, stray text) switches the tier off,
+                // so syntax this parser doesn't understand can never drop a restriction.
                 const policy = { agentSafe: false, maxLines: 400, sensitive: [], pivotal: [] };
+                const off = (why) => ({ ...policy, agentSafe: false, invalid: why });
                 let list = null;
                 for (const raw of String(text || '').split('\n')) {
-                  // Blank and comment-only lines never end a list (a comment between two
-                  // sensitive paths must not drop the second one).
                   if (/^\s*(#.*)?$/.test(raw)) continue;
                   const line = raw.replace(/\s+#.*$/, '');
-                  // List items, indented or not (YAML allows `key:\n- item`).
                   const item = /^\s*-\s*["']?([^"']+?)["']?\s*$/.exec(line);
-                  if (item && list) { policy[list].push(item[1]); continue; }
-                  // Anything else inside a list that isn't a new top-level key is syntax this
-                  // parser doesn't read: fail closed (tier off) rather than lose a restriction.
-                  if (list && (/^\s/.test(line) || !/^[a-z_]+:/.test(line))) return { ...policy, agentSafe: false, invalid: `unreadable line in ${list} list: ${line.trim()}` };
+                  if (list && item) { policy[list].push(item[1]); continue; }
+                  const kv = /^([a-z_]+):(?:\s+(.*))?$/.exec(line);
+                  if (!kv) return off(`unreadable line: ${line.trim()}`);
                   list = null;
-                  const kv = /^([a-z_]+):\s*(.*)$/.exec(line);
-                  if (!kv) continue;
-                  const [, key, value] = kv;
-                  if (key === 'agent_safe') policy.agentSafe = value.trim() === 'true';
-                  else if (key === 'agent_max_lines' && /^\d+$/.test(value.trim())) policy.maxLines = Number(value.trim());
+                  const key = kv[1]; const value = (kv[2] || '').trim();
+                  if (key === 'agent_safe') policy.agentSafe = value === 'true';
+                  else if (key === 'agent_max_lines') { if (!/^\d+$/.test(value)) return off('agent_max_lines is not a number'); policy.maxLines = Number(value); }
                   else if (key === 'sensitive_paths' || key === 'pivotal_paths') {
-                    list = key === 'sensitive_paths' ? 'sensitive' : 'pivotal';
-                    const v = value.trim();
-                    const inline = /^\[(.*)\]$/.exec(v);
-                    if (inline) { policy[list].push(...inline[1].split(',').map((x) => x.trim().replace(/^["']|["']$/g, '')).filter(Boolean)); list = null; }
-                    else if (v) return { ...policy, agentSafe: false, invalid: `unreadable value for ${key}` };
+                    const name = key === 'sensitive_paths' ? 'sensitive' : 'pivotal';
+                    const inline = /^\[(.*)\]$/.exec(value);
+                    if (inline) policy[name].push(...inline[1].split(',').map((x) => x.trim().replace(/^["']|["']$/g, '')).filter(Boolean));
+                    else if (!value) list = name;
+                    else return off(`unreadable value for ${key}`);
                   }
                 }
                 return policy;
@@ -227,10 +226,11 @@ jobs:
                 // Codex's summary tracks whether its findings are resolved, so it is
                 // authoritative for Codex; raw P0/P1 line findings only count for others.
                 const findings = feedback.filter((x) => VERDICT_BOTS.has(x.author) && x.author !== CODEX_BOT && x.commitId === headSha && BLOCKING_FINDING.test(x.body || ''));
-                const verdicts = feedback.filter((x) => !codexPr || x.author === CODEX_BOT).map((x) => verdictFor(x, headSha)).filter(Boolean);
-                // A blocking Claude verdict still blocks on a Codex PR (via secondReview too).
-                const claudeBlocks = codexPr && feedback.some((x) => x.author !== CODEX_BOT && verdictFor(x, headSha) === 'blocking');
-                if (findings.length || claudeBlocks || verdicts.includes('blocking')) return 'blocking';
+                // On a Codex PR, Claude's verdicts and findings belong to secondReview only,
+                // so overriding or clearing them can never stand in for Codex's own review.
+                const primary = codexPr ? feedback.filter((x) => x.author === CODEX_BOT) : feedback;
+                const verdicts = primary.map((x) => verdictFor(x, headSha)).filter(Boolean);
+                if ((!codexPr && findings.length) || verdicts.includes('blocking')) return 'blocking';
                 if (verdicts.includes('pending')) return 'missing';
                 return verdicts.includes('clear') ? 'clear' : 'missing';
               }
@@ -249,7 +249,9 @@ jobs:
                   .map((x) => parse(VERDICT, x.body))
                   .filter((v) => v && v.commit_sha === headSha)
                   .map((v) => v.result);
-                if (results.includes('blocking')) return 'blocking';
+                // claude[bot] P0/P1 line findings on the head commit block here too.
+                const findings = feedback.some((x) => x.author === 'claude[bot]' && x.commitId === headSha && BLOCKING_FINDING.test(x.body || ''));
+                if (findings || results.includes('blocking')) return 'blocking';
                 return results.includes('clear') ? 'clear' : 'missing';
               }
 

@@ -293,3 +293,43 @@ test('on a Codex PR a Claude verdict alone never stands in for Codex review (Cod
   // Claude PRs: a claude[bot] verdict still counts as a review, as before
   assert.equal(g.reviewState({ ...agentPr, feedback: [verdictBy('claude[bot]', 'H', 'clear')] }), 'clear');
 });
+
+// ---- third-round Codex findings ---------------------------------------------
+test('policy parser is an allowlist: quoted keys or other odd lines turn the tier off (Codex P2)', () => {
+  assert.equal(g.parseOpsPolicy('agent_safe: true\n"sensitive_paths":\n  - src/auth/**\n').agentSafe, false);
+  assert.equal(g.parseOpsPolicy('agent_safe: true\n  sensitive_paths:\n  - src/auth/**\n').agentSafe, false);
+  assert.equal(g.parseOpsPolicy('agent_safe: true\nagent_max_lines: lots\n').agentSafe, false);
+  // the real .ops.yml files (flow maps, inline comments) still parse
+  const real = `# header
+app: london-living-app
+web: true
+install: cd app && npm ci
+data: { fetch: scripts/fetch_app_data.sh, into: data/processed/discovery }
+coverage: ./gradlew testDebugUnitTest  # Kover/JaCoCo to be added
+dead_code: { tool: knip, paths: [app], ignore: ["app/src/routes/**"] }
+agent_safe: true
+sensitive_paths:
+  - "src/auth/**"
+pivotal_paths: [src/routes/reveal/**]
+`;
+  const p = g.parseOpsPolicy(real);
+  assert.equal(p.agentSafe, true);
+  assert.deepEqual([p.sensitive, p.pivotal], [['src/auth/**'], ['src/routes/reveal/**']]);
+});
+
+test('on a Codex PR, overriding a blocking Claude verdict never stands in for Codex review (Codex P2)', () => {
+  const overrideEvents = [{ event: 'labeled', label: 'review:override', actor: OWNER, viaApp: false, at: '2026-11-06T11:00:00Z' }];
+  const noCodex = { ...codexPr, labels: ['review:override'], labelEvents: overrideEvents, feedback: [verdictBy('claude[bot]', 'H', 'blocking')] };
+  assert.equal(g.reviewState(noCodex), 'missing');
+  assert.equal(g.decide(noCodex).state, 'pending');
+  // with Codex clear, the same override does overrule the Claude block
+  assert.equal(g.decide({ ...noCodex, feedback: [codex('H'), verdictBy('claude[bot]', 'H', 'blocking')] }).state, 'success');
+  // without the override, a blocking Claude verdict fails a Codex-cleared PR
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), verdictBy('claude[bot]', 'H', 'blocking')] }).state, 'failure');
+});
+
+test('on a Codex PR, a claude[bot] P0/P1 line finding blocks through the second review', () => {
+  const line = { author: 'claude[bot]', commitId: 'H', body: '![P1 Badge](https://img.shields.io/badge/P1-orange) problem' };
+  assert.equal(g.secondReview({ headRef: 'codex/7', feedback: [line, verdictBy('claude[bot]', 'H', 'clear')], headSha: 'H', owner: OWNER }), 'blocking');
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), line, verdictBy(OWNER, 'H', 'clear')] }).state, 'failure');
+});
