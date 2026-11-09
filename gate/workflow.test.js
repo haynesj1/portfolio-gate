@@ -157,9 +157,9 @@ test('caller comment filter: review results evaluate, other comments are skipped
   assert.equal(onComment(codex('{"code_review": {"commit_sha": "abc", "has_unresolved_findings": false, "status": "completed"}}')), true);
   assert.equal(onComment(codex('{"code_review":{"commit_sha":"abc","has_unresolved_findings":false,"status":"succeeded"}}')), true);
   assert.equal(onComment(codex('{"code_review":{"commit_sha":"abc","has_unresolved_findings":false,"status":"success"}}')), true);
-  // Still running: skipped, in either spacing.
-  assert.equal(onComment(codex('{"code_review":{"commit_sha":"abc","has_any_findings":null,"status":"running"}}')), false);
-  assert.equal(onComment(codex('{"code_review": {"commit_sha": "abc", "status": "running"}}')), false);
+  // Any Codex summary evaluates, whatever its state: the gate's parser decides.
+  assert.equal(onComment(codex('{"code_review":{"commit_sha":"abc","has_any_findings":null,"status":"running"}}')), true);
+  assert.equal(onComment(codex('{"code_review":{"commit_sha":"abc","status":"completed","has_unresolved_findings":false},"security_review":{"status":"running"}}')), true);
   // Claude reviewer verdicts evaluate.
   assert.equal(onComment('<!-- review-verdict:v1 {"commit_sha":"abc","result":"clear"} -->'), true);
   assert.equal(onComment('<!-- review-verdict:v1 {"commit_sha":"abc","result":"blocking"} -->'), true);
