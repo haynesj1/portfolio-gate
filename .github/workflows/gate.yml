@@ -337,13 +337,14 @@ jobs:
                 policy = gate.parseOpsPolicy(Buffer.from(data.content, 'base64').toString('utf8'));
               } catch (e) { core.info(`no .ops.yml policy: ${e.status || e.message}`); }
               const issueNumber = gate.linkedIssue(pr.head.ref, pr.body);
-              let issue = null;
-              if (policy?.agentSafe && issueNumber) {
+              const readIssue = async () => {
+                if (!policy?.agentSafe || !issueNumber) return null;
                 try {
                   const { data } = await github.rest.issues.get({ owner, repo, issue_number: issueNumber });
-                  if (!data.pull_request) issue = { number: issueNumber, state: data.state, labels: data.labels.map((l) => (typeof l === 'string' ? l : l.name)) };
-                } catch (e) { core.info(`linked issue #${issueNumber} not readable: ${e.status || e.message}`); }
-              }
+                  return data.pull_request ? null : { number: issueNumber, state: data.state, labels: data.labels.map((l) => (typeof l === 'string' ? l : l.name)) };
+                } catch (e) { core.info(`linked issue #${issueNumber} not readable: ${e.status || e.message}`); return null; }
+              };
+              const issue = await readIssue();
               const input = {
                 author: pr.user.login,
                 headRef: pr.head.ref,
@@ -365,20 +366,36 @@ jobs:
                 headAdoptedAt: adopted[0],
                 forcePushTimes,
               };
-              const result = gate.decide(input);
-              core.info(JSON.stringify({ ...result, headAdoptedAt: input.headAdoptedAt }, null, 2));
-              const want = `risk:${result.risk}`;
-              if (!input.labels.includes(want)) await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: [want] });
-              for (const other of ['risk:low', 'risk:agent', 'risk:normal'].filter((l) => l !== want && input.labels.includes(l))) {
-                await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name: other }).catch(() => {});
+              const publish = async (result, labels) => {
+                core.info(JSON.stringify({ ...result, headAdoptedAt: input.headAdoptedAt }, null, 2));
+                const want = `risk:${result.risk}`;
+                if (!labels.includes(want)) await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: [want] });
+                for (const other of ['risk:low', 'risk:agent', 'risk:normal'].filter((l) => l !== want && labels.includes(l))) {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name: other }).catch(() => {});
+                }
+                await github.rest.repos.createCommitStatus({
+                  owner, repo, sha: headSha, context: 'review-gate',
+                  state: result.state, description: result.description.slice(0, 140),
+                  // Provenance: the daily audit checks each merged PR's final status
+                  // links to a pr-gate run (decision 0003).
+                  target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+                });
+              };
+              let result = gate.decide(input);
+              await publish(result, input.labels);
+              // Write, then verify: a run that published an agent-safe pass re-reads
+              // the linked issue afterwards. If it changed meanwhile (closed, unqueued,
+              // marked pivotal), recompute and publish again. Whichever run writes last
+              // has therefore checked the issue after the change, so a slower,
+              // older run can't leave a stale pass over an issue-triggered revocation.
+              for (let i = 0; i < 3 && result.risk === 'agent'; i++) {
+                const now = await readIssue();
+                if (JSON.stringify(now) === JSON.stringify(input.issue)) break;
+                const labels = [`risk:${result.risk}`, ...input.labels.filter((l) => !/^risk:/.test(l))];
+                input.issue = now;
+                result = gate.decide(input);
+                await publish(result, labels);
               }
-              await github.rest.repos.createCommitStatus({
-                owner, repo, sha: headSha, context: 'review-gate',
-                state: result.state, description: result.description.slice(0, 140),
-                // Provenance: the daily audit checks each merged PR's final status
-                // links to a pr-gate run (decision 0003).
-                target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
-              });
               await core.summary.addHeading(`review-gate: ${result.state}`).addList([
                 `risk: ${result.risk} (${result.reasons.join('; ')})`, `review: ${result.review}`, `human-approved: ${result.approved}`,
               ]).write();

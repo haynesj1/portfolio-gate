@@ -55,7 +55,7 @@ function harness({ headSha = 'H', event = 'pull_request_target', action = 'synch
     payload: issueEvent || { action, label: action === 'labeled' ? { name: 'human-approved' } : undefined, pull_request: { number: 1, updated_at: '2026-11-06T10:00:00Z' } },
   };
   const core = { info() {}, warning() {}, summary: { addHeading() { return this; }, addList() { return this; }, write: async () => {} } };
-  return { run: () => script(github, context, core), written, added, seenRefs, gate: () => written.filter((s) => s.context === 'review-gate').at(-1) };
+  return { github, run: () => script(github, context, core), written, added, seenRefs, gate: () => written.filter((s) => s.context === 'review-gate').at(-1) };
 }
 
 test('workflow: owner approval after the head was first seen passes', async () => {
@@ -223,4 +223,24 @@ test('workflow: an issue event re-evaluates only the open PRs that implement it'
 test('caller: PR body edits re-evaluate (the linked issue can live in the body)', () => {
   const callerYml = fs.readFileSync(path.join(__dirname, '..', 'caller', 'pr-gate.yml'), 'utf8');
   assert.match(callerYml, /pull_request_target:\n(\s+#.*\n)*\s+types: \[opened, edited,/);
+});
+
+test('workflow: a run that published an agent-safe pass re-checks the issue and withdraws it if it changed (Codex P2)', async () => {
+  // The issue gains `pivotal` between this run's first read and its write: the
+  // stale pass must be replaced by this same run.
+  let reads = 0;
+  const h = harness({ headRef: 'claude/7', ops: 'agent_safe: true\n', comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  const before = { number: 7, state: 'open', labels: [{ name: 'ready' }] };
+  const after = { number: 7, state: 'open', labels: [{ name: 'ready' }, { name: 'pivotal' }] };
+  h.github.rest.issues.get = async () => ({ data: reads++ === 0 ? before : after });
+  await h.run();
+  const states = h.written.filter((x) => x.context === 'review-gate').map((x) => x.state);
+  assert.deepEqual(states, ['success', 'pending']);
+  assert.equal(h.gate().state, 'pending');
+});
+
+test('workflow: an unchanged issue means one write only', async () => {
+  const h = harness({ headRef: 'claude/7', ops: 'agent_safe: true\n', issue: { number: 7, state: 'open', labels: [{ name: 'ready' }] }, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  await h.run();
+  assert.equal(h.written.filter((x) => x.context === 'review-gate').length, 1);
 });

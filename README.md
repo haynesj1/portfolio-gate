@@ -37,7 +37,7 @@ pivotal_paths:         # core-journey UI that the owner wants to see first
 
 Policy parsing fails closed: blank lines and comments inside a path list are skipped, and any line the gate can't read switches the tier off for that repo (everything is `risk:normal`).
 
-Because the tier depends on the linked issue, the caller also listens to `issues` events (closed, reopened, or a `ready` / `in-progress` / `pivotal` label change) and re-evaluates the open PRs that implement that issue. Marking an issue `pivotal` therefore withdraws an earlier agent-safe pass at once. Merge this repo's gate change **before** syncing the caller to app repos, or the older gate will fail on issue events.
+Because the tier depends on the linked issue, the caller also listens to `issues` events (closed, reopened, or a `ready` / `in-progress` / `pivotal` label change) and re-evaluates the open PRs that implement that issue. Marking an issue `pivotal` therefore withdraws an earlier agent-safe pass at once. Runs keyed by the PR and by the issue can overlap, so any run that publishes an agent-safe pass re-reads the linked issue afterwards and republishes if it changed: the last writer has always seen the change. Merge this repo's gate change **before** syncing the caller to app repos, or the older gate will fail on issue events.
 
 Residual risk, accepted in portfolio-ops decision 0005: agents act with the owner's identity, so they can set issue labels such as `ready` or remove `pivotal`. The path, size and test rules and the review are the real controls; the daily merge audit and the dashboard's auto-merge digest catch the rest.
 
