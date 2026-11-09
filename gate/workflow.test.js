@@ -148,8 +148,10 @@ test('caller comment filter: review results evaluate, other comments are skipped
   const start = lines.findIndex((l) => /^\s+if: >-$/.test(l));
   const expr = lines.slice(start + 1).filter((l, i, a) => a.slice(0, i + 1).every((x) => /^\s{6}/.test(x))).join(' ');
   const contains = (hay, needle) => String(hay ?? '').toLowerCase().includes(String(needle).toLowerCase());
-  const run = (github) => Boolean(new Function('github', 'contains', `return (${expr});`)(github, contains));
-  const onComment = (body, pr = true) => run({ event_name: 'issue_comment', event: { issue: pr ? { pull_request: { url: 'x' } } : {}, comment: { body } } });
+  // GitHub expressions read a missing property as null; optional chaining does the same here.
+  const js = expr.replace(/github(\.\w+)+/g, (m) => m.replace(/\./g, '?.'));
+  const run = (github) => Boolean(new Function('github', 'contains', `return (${js});`)(github, contains));
+  const onComment = (body, pr = true, from) => run({ event_name: 'issue_comment', event: { issue: pr ? { pull_request: { url: 'x' } } : {}, comment: { body }, ...(from === undefined ? {} : { changes: { body: { from } } }) } });
   const codex = (state) => `<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 ${state} -->\n<details>Codex Review Summary</details>`;
   // Real Codex summaries (Nov 2026 format, no spaces) and other valid spellings.
   assert.equal(onComment(codex('{"code_review":{"commit_sha":"abc","has_any_findings":false,"has_unresolved_findings":false,"status":"completed"},"security_review":{"status":null}}')), true);
@@ -167,6 +169,11 @@ test('caller comment filter: review results evaluate, other comments are skipped
   assert.equal(onComment('Fixed in the latest push.'), false);
   assert.equal(onComment('<!-- pr-summary:v1 -->\n## Summary for Jordan'), false);
   assert.equal(onComment(codex('{"code_review":{"status":"completed"}}'), false), false);
+  // An edit that removes a verdict or Codex summary still evaluates, so the gate
+  // recomputes; an edit between two ordinary bodies is skipped.
+  assert.equal(onComment('Withdrawn: re-reviewing.', true, '<!-- review-verdict:v1 {"commit_sha":"abc","result":"clear"} -->'), true);
+  assert.equal(onComment('gone', true, codex('{"code_review":{"status":"completed"}}')), true);
+  assert.equal(onComment('Fixed now.', true, 'Fixed in the latest push.'), false);
   // PR events always evaluate.
   for (const event_name of ['pull_request_target']) assert.equal(run({ event_name, event: {} }), true);
 });

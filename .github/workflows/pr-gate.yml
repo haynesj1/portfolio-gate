@@ -28,12 +28,16 @@ jobs:
     # Actions minutes. Codex summaries always evaluate, whatever their status or
     # JSON spacing: the gate's own parser decides what they mean, so this filter
     # can never hide a review result. PR events (push, labels, ready) always
-    # evaluate. Tested in gate/workflow.test.js ("caller comment filter").
+    # evaluate. An edit that removes a review result also evaluates (the previous
+    # body is checked too), so withdrawn evidence is recomputed at once.
+    # Tested in gate/workflow.test.js ("caller comment filter").
     if: >-
       github.event_name != 'issue_comment' ||
       (github.event.issue.pull_request &&
        (contains(github.event.comment.body, 'review-verdict:v1') ||
-        contains(github.event.comment.body, 'codex-review-state:v1')))
+        contains(github.event.comment.body, 'codex-review-state:v1') ||
+        contains(github.event.changes.body.from, 'review-verdict:v1') ||
+        contains(github.event.changes.body.from, 'codex-review-state:v1')))
     # One evaluation per PR at a time; a newer one cancels an older one. Set on the
     # job, not the workflow, so a skipped comment run never cancels a real one.
     concurrency:
