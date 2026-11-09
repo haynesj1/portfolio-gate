@@ -50,6 +50,81 @@ function classifyFile(file) {
   return { low: false, why: `code change ${filename}` };
 }
 
+// Agent-safe tier (portfolio-ops decision 0005). Opt-in per repo through
+// `.ops.yml` on the default branch (a protected path, so agents can't change
+// it in a PR). A PR qualifies only if it is an agent PR for a linked, queued,
+// non-pivotal issue, touches no protected, dependency, sensitive or pivotal
+// path, doesn't delete or skip tests, and stays under the size cap.
+// Only the keys below are read, so a tiny parser is enough (no YAML library).
+function parseOpsPolicy(text) {
+  const policy = { agentSafe: false, maxLines: 400, sensitive: [], pivotal: [] };
+  let list = null;
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.replace(/\s+#.*$/, '').replace(/^#.*$/, '');
+    const item = /^\s+-\s*["']?([^"']+?)["']?\s*$/.exec(line);
+    if (item && list) { policy[list].push(item[1]); continue; }
+    list = null;
+    const kv = /^([a-z_]+):\s*(.*)$/.exec(line);
+    if (!kv) continue;
+    const [, key, value] = kv;
+    if (key === 'agent_safe') policy.agentSafe = value.trim() === 'true';
+    else if (key === 'agent_max_lines' && /^\d+$/.test(value.trim())) policy.maxLines = Number(value.trim());
+    else if (key === 'sensitive_paths' || key === 'pivotal_paths') {
+      list = key === 'sensitive_paths' ? 'sensitive' : 'pivotal';
+      const inline = /^\[(.*)\]$/.exec(value.trim());
+      if (inline) { policy[list].push(...inline[1].split(',').map((x) => x.trim().replace(/^["']|["']$/g, '')).filter(Boolean)); list = null; }
+    }
+  }
+  return policy;
+}
+
+// Glob: `**` any path (including none), `*` within one path segment.
+function globToRegExp(glob) {
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*' && glob[i + 1] === '*') { re += glob[i + 2] === '/' ? '(?:.*/)?' : '.*'; i += glob[i + 2] === '/' ? 2 : 1; }
+    else if (c === '*') re += '[^/]*';
+    else re += /[.+?^${}()|[\]\\]/.test(c) ? `\\${c}` : c;
+  }
+  // Built by concatenation: gate/build.js inlines this file with String.replace,
+  // where a dollar sign before a backtick or ampersand is a special pattern.
+  const tail = glob.endsWith('/') ? '.*' : '(?:/.*)?';
+  return new RegExp('^' + re + tail + '\u0024');
+}
+const matchesAny = (file, globs) => globs.some((g) => globToRegExp(g).test(file));
+
+// The issue an agent PR implements: from a `claude/<n>` or `codex/<n>` branch,
+// else the first `Closes #n` in the body.
+function linkedIssue(headRef, body) {
+  const b = /^(?:claude|codex)\/(\d+)$/.exec(headRef || '');
+  if (b) return Number(b[1]);
+  const c = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b/i.exec(body || '');
+  return c ? Number(c[1]) : null;
+}
+
+// Returns { ok, why }. `issue` is { state, labels } of the linked issue or null.
+function agentSafe({ headRef, files, policy, issue }) {
+  if (!policy?.agentSafe) return { ok: false, why: 'agent-safe tier not enabled for this repo' };
+  if (!/^(claude|codex)\//.test(headRef || '')) return { ok: false, why: 'not an agent branch' };
+  if (!issue) return { ok: false, why: 'no linked issue' };
+  if (issue.state !== 'open') return { ok: false, why: 'linked issue is not open' };
+  if (!issue.labels.includes('ready') && !issue.labels.includes('in-progress')) return { ok: false, why: 'linked issue was not queued (ready)' };
+  if (issue.labels.includes('pivotal')) return { ok: false, why: 'linked issue is pivotal' };
+  for (const f of files) {
+    if (isDependencyFile(f.filename)) return { ok: false, why: `dependency file ${f.filename}` };
+    if (matchesAny(f.filename, policy.sensitive)) return { ok: false, why: `sensitive path ${f.filename}` };
+    if (matchesAny(f.filename, policy.pivotal)) return { ok: false, why: `pivotal path ${f.filename}` };
+    if (isTest(f.filename)) {
+      const c = classifyFile(f);
+      if (!c.low) return { ok: false, why: c.why };
+    } else if (f.status === 'removed') return { ok: false, why: `file deleted: ${f.filename}` };
+  }
+  const lines = files.reduce((n, f) => n + (f.additions || 0) + (f.deletions || 0), 0);
+  if (lines > policy.maxLines) return { ok: false, why: `${lines} lines changed (cap ${policy.maxLines})` };
+  return { ok: true, why: `agent-safe: queued issue #${issue.number ?? '?'}, ${lines} lines, no sensitive paths` };
+}
+
 function isPatchBump(title) {
   const m = /from v?(\d+)\.(\d+)\.(\d+)\S* to v?(\d+)\.(\d+)\.(\d+)/.exec(title || '');
   return !!m && m[1] === m[4] && m[2] === m[5];
@@ -57,7 +132,7 @@ function isPatchBump(title) {
 
 // commits: authors of every commit on the PR (logins), used so that code
 // pushed onto a Dependabot branch by anyone else loses the Dependabot path.
-function classify({ author, title, labels, files, commitAuthors = [] }) {
+function classify({ author, title, labels, files, commitAuthors = [], headRef, policy, issue }) {
   if (files.some((f) => isProtected(f.filename))) {
     return { risk: 'normal', reasons: files.filter((f) => isProtected(f.filename)).map((f) => `protected path ${f.filename}`) };
   }
@@ -76,7 +151,9 @@ function classify({ author, title, labels, files, commitAuthors = [] }) {
   }
   const results = files.map(classifyFile);
   const blockers = results.filter((r) => !r.low).map((r) => r.why);
-  return blockers.length ? { risk: 'normal', reasons: blockers } : { risk: 'low', reasons: [...new Set(results.map((r) => r.why))] };
+  if (!blockers.length) return { risk: 'low', reasons: [...new Set(results.map((r) => r.why))] };
+  const safe = agentSafe({ headRef, files, policy, issue });
+  return safe.ok ? { risk: 'agent', reasons: [safe.why] } : { risk: 'normal', reasons: [...blockers, safe.why] };
 }
 
 // Structured verdicts bound to a commit:
@@ -147,10 +224,11 @@ function decide(input) {
   else if (review === 'blocking') { state = 'failure'; description = 'Reviewer found P0/P1 issues on this commit (or review:blocking)'; }
   else if (review === 'missing') { state = 'pending'; description = 'Waiting for a completed review of this commit'; }
   else if (risk === 'low') { state = 'success'; description = overridden ? 'risk:low; review findings overridden by owner' : 'risk:low and reviewed'; }
+  else if (risk === 'agent') { state = 'success'; description = overridden ? 'risk:agent; review findings overridden by owner' : 'risk:agent (agent-safe) and reviewed'; }
   else if (approved) { state = 'success'; description = overridden ? 'human-approved; review findings overridden by owner' : 'human-approved and reviewed'; }
   else if (input.labels.includes('human-approved')) { state = 'pending'; description = 'risk:normal: approval predates this commit; remove and re-add human-approved'; }
   else { state = 'pending'; description = 'risk:normal: waiting for human-approved'; }
   return { risk, reasons, review, overridden, approved, state, description };
 }
 
-module.exports = { ACTIONS_BOT, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
+module.exports = { ACTIONS_BOT, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };

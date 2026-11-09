@@ -129,3 +129,69 @@ test('decide: end-to-end outcomes', () => {
   assert.equal(g.decide({ ...dep, feedback: [] }).state, 'pending');
   assert.equal(g.decide(dep).state, 'success');
 });
+
+// ---- agent-safe tier (portfolio-ops decision 0005) -----------------------
+const OPS = `app: x
+agent_safe: true   # on for this repo
+agent_max_lines: 300
+sensitive_paths:
+  - "src/auth/**"
+  - db/migrations/
+pivotal_paths: ["src/routes/reveal/**"]
+`;
+const policy = g.parseOpsPolicy(OPS);
+const queued = { number: 7, state: 'open', labels: ['ready', 'agent:claude'] };
+const agentPr = { ...base, headRef: 'claude/7', policy, issue: queued, files: [f('src/app.ts', '+x', { additions: 20, deletions: 5 })] };
+
+test('agent-safe: .ops.yml policy is parsed, off by default', () => {
+  assert.deepEqual(policy, { agentSafe: true, maxLines: 300, sensitive: ['src/auth/**', 'db/migrations/'], pivotal: ['src/routes/reveal/**'] });
+  assert.equal(g.parseOpsPolicy('app: x\n').agentSafe, false);
+  assert.equal(g.parseOpsPolicy('').maxLines, 400);
+});
+
+test('agent-safe: globs match paths and directories', () => {
+  assert.ok(g.globToRegExp('src/auth/**').test('src/auth/a/b.ts'));
+  assert.ok(g.globToRegExp('db/migrations/').test('db/migrations/001.sql'));
+  assert.ok(g.globToRegExp('*.sql').test('a.sql'));
+  assert.ok(!g.globToRegExp('*.sql').test('dir/a.sql'));
+  assert.ok(!g.globToRegExp('src/auth/**').test('src/authz.ts'));
+});
+
+test('agent-safe: linked issue from branch or Closes line', () => {
+  assert.equal(g.linkedIssue('claude/12', ''), 12);
+  assert.equal(g.linkedIssue('codex/fix-map', 'Closes #34\n...'), 34);
+  assert.equal(g.linkedIssue('feature/x', 'nothing'), null);
+});
+
+test('agent-safe: a small agent PR for a queued issue is risk:agent and passes once reviewed', () => {
+  assert.equal(g.classify(agentPr).risk, 'agent');
+  const d = g.decide(agentPr);
+  assert.equal(d.state, 'success');
+  assert.match(d.description, /agent-safe/);
+  assert.equal(g.decide({ ...agentPr, feedback: [] }).state, 'pending');
+  assert.equal(g.decide({ ...agentPr, feedback: [codex('H', true)] }).state, 'failure');
+});
+
+test('agent-safe: each condition falls back to risk:normal', () => {
+  const normal = (over) => g.classify({ ...agentPr, ...over }).risk;
+  assert.equal(normal({ policy: g.parseOpsPolicy('app: x') }), 'normal');
+  assert.equal(normal({ policy: null }), 'normal');
+  assert.equal(normal({ headRef: 'feature/7' }), 'normal');
+  assert.equal(normal({ issue: null }), 'normal');
+  assert.equal(normal({ issue: { ...queued, state: 'closed' } }), 'normal');
+  assert.equal(normal({ issue: { ...queued, labels: ['agent:claude'] } }), 'normal');
+  assert.equal(normal({ issue: { ...queued, labels: ['ready', 'pivotal'] } }), 'normal');
+  assert.equal(normal({ files: [f('src/auth/login.ts')] }), 'normal');
+  assert.equal(normal({ files: [f('src/routes/reveal/+page.svelte')] }), 'normal');
+  assert.equal(normal({ files: [f('package.json')] }), 'normal');
+  assert.equal(normal({ files: [f('src/old.ts', '', { status: 'removed' })] }), 'normal');
+  assert.equal(normal({ files: [f('src/a.test.ts', "-it('works', () => {})")] }), 'normal');
+  assert.equal(normal({ files: [f('src/a.ts', '+x', { additions: 250, deletions: 51 })] }), 'normal');
+  assert.equal(normal({ files: [f('.github/workflows/ci.yml')] }), 'normal');
+  assert.equal(normal({ files: [f('AGENTS.md')] }), 'normal');
+});
+
+test('agent-safe: in-progress issue still counts as queued; tests added alongside code are fine', () => {
+  assert.equal(g.classify({ ...agentPr, issue: { ...queued, labels: ['in-progress'] } }).risk, 'agent');
+  assert.equal(g.classify({ ...agentPr, files: [f('src/a.ts'), f('src/a.test.ts', "+it('x', () => {})")] }).risk, 'agent');
+});

@@ -3,7 +3,33 @@
 A merge gate for repositories where AI coding agents open pull requests. It sets one required commit status, `review-gate`, that passes only when:
 
 1. **a reviewer bot has reviewed the current head commit** with no unresolved P0/P1 findings (Codex's review summary, or a structured verdict from a Claude reviewer), and
-2. **the change is low risk** (docs, added tests, Dependabot patch bumps, deletion-only dead-code removal), **or the repository owner has approved this exact commit** with the `human-approved` label.
+2. one of:
+   - **the change is low risk** (`risk:low`: docs, added tests, Dependabot patch bumps, deletion-only dead-code removal);
+   - **the change is agent-safe** (`risk:agent`, opt-in per repo, see below);
+   - **the repository owner has approved this exact commit** with the `human-approved` label (`risk:normal`).
+
+## Agent-safe tier (`risk:agent`)
+
+Off unless the repo's `.ops.yml` **on the default branch** says `agent_safe: true` (the gate never reads the PR's copy, and `.ops.yml` is a protected path). A PR is agent-safe only if all of these hold:
+
+- its branch is `claude/…` or `codex/…`, and it implements a linked issue (`claude/<n>`, `codex/<n>`, or `Closes #n`) that is open, queued (`ready` or `in-progress`) and **not** labelled `pivotal`;
+- it touches no protected path, no dependency manifest, nothing under `sensitive_paths` or `pivotal_paths` from `.ops.yml`, and deletes no file;
+- it deletes or skips no test or assertion;
+- it changes at most `agent_max_lines` lines (default 400);
+- a reviewer bot has cleared the head commit, as for every tier. CI checks are required separately by the repo's ruleset.
+
+```yaml
+# .ops.yml (example)
+agent_safe: true
+agent_max_lines: 400
+sensitive_paths:       # always need human-approved
+  - "src/auth/**"
+  - db/migrations/
+pivotal_paths:         # core-journey UI that the owner wants to see first
+  - "src/routes/reveal/**"
+```
+
+Residual risk, accepted in portfolio-ops decision 0005: agents act with the owner's identity, so they can set issue labels such as `ready` or remove `pivotal`. The path, size and test rules and the review are the real controls; the daily merge audit and the dashboard's auto-merge digest catch the rest.
 
 ## Why it looks the way it does
 
