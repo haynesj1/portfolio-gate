@@ -244,3 +244,22 @@ test('workflow: an unchanged issue means one write only', async () => {
   await h.run();
   assert.equal(h.written.filter((x) => x.context === 'review-gate').length, 1);
 });
+
+test('workflow: the post-write check also catches a PR body edit that drops the linked issue (Codex P2)', async () => {
+  // Branch without an issue number: the link comes from the body, which loses
+  // `Closes #7` between this run's first read and its write.
+  const h = harness({ headRef: 'claude/fix-login', ops: 'agent_safe: true\n', issue: { number: 7, state: 'open', labels: [{ name: 'ready' }] }, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  const base = (body) => ({ data: { state: 'open', draft: false, title: 't', body, user: { login: OWNER }, labels: [], head: { sha: 'H', ref: 'claude/fix-login' }, base: { repo: { default_branch: 'main' } } } });
+  let gets = 0;
+  h.github.rest.pulls.get = async () => (gets++ === 0 ? base('Closes #7') : base('no link any more'));
+  await h.run();
+  assert.deepEqual(h.written.filter((x) => x.context === 'review-gate').map((x) => x.state), ['success', 'pending']);
+});
+
+test('workflow: the post-write check stops if a newer commit has arrived', async () => {
+  const h = harness({ headRef: 'claude/7', ops: 'agent_safe: true\n', issue: { number: 7, state: 'open', labels: [{ name: 'ready' }] }, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  const get = h.github.rest.pulls.get; let gets = 0;
+  h.github.rest.pulls.get = async (a) => { const r = await get(a); return gets++ === 0 ? r : { data: { ...r.data, head: { ...r.data.head, sha: 'NEW' } } }; };
+  await h.run();
+  assert.equal(h.written.filter((x) => x.context === 'review-gate').length, 1);
+});
