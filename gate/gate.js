@@ -13,8 +13,9 @@ const PROTECTED = [
   /^specs\//, /^docs\/vision\.md$/, /^docs\/decisions\//,
 ];
 const TEST_PATH = [
-  /(^|\/)(tests?|__tests__|e2e|spec)\//, /\.(test|spec)\.[cm]?[jt]sx?$/,
-  /(^|\/)test_[^/]*\.py$/, /_test\.py$/, /(^|\/)src\/(test|androidTest)\//,
+  /(^|\/)(tests?|__tests__|e2e|spec|specs|testdata)\//, /\.(test|spec)\.[cm]?[jt]sx?$/,
+  /(^|\/)test_[^/]*\.py$/, /_test\.(py|go|rs|exs?)$/, /_spec\.rb$/, /(^|\/)src\/(test|androidTest)\//,
+  /(Test|Tests|Spec)\.(kt|kts|java|swift|scala|cs)$/,
 ];
 const DOC_PATH = [/\.md$/, /^docs\//];
 const DEPENDENCY_FILES = [
@@ -32,9 +33,10 @@ const PACKAGE_CONFIG_FILES = [
   /(^|\/)pip\.conf$/, /(^|\/)gradle\.properties$/, /(^|\/)gradle\/wrapper\//,
 ];
 // A removed line in a test file that looks like a test or an assertion.
-const REMOVED_TEST_LINE = /^-(?!--).*(\b(it|test|describe)\s*\(|def test_|@Test\b|\bexpect\s*\(|\bassert)/m;
+// Covers JS/TS, Python, Kotlin/Java, Go, Rust, Ruby, Swift and Elixir test syntax.
+const REMOVED_TEST_LINE = /^-(?!--).*(\b(it|test|describe|context)\s*[('"]|def test_|@Test\b|\bexpect\s*[({]|\bassert|\bfunc Test\w*\(|#\[(tokio::)?test\]|\bt\.(Error|Errorf|Fatal|Fatalf|Run)\(|\bXCTAssert|\brequire\.\w+\()/m;
 // An added line that disables or narrows tests.
-const ADDED_SKIP_LINE = /^\+(?!\+\+).*(\.(skip|only|todo)\s*\(|\bx(it|describe)\s*\(|@pytest\.mark\.skip|@Ignore\b|@Disabled\b)/m;
+const ADDED_SKIP_LINE = /^\+(?!\+\+).*(\.(skip|only|todo|fixme)\s*\(|\bx(it|describe|test)\s*\(|@pytest\.mark\.(skip|xfail)|pytest\.skip\(|@unittest\.skip|@Ignore\b|@Disabled\b|\bt\.Skip(Now|f)?\(|#\[ignore\]|@tag :skip|\bpending\b\s*(\(|$))/m;
 const BLOCKING_FINDING = /(badge\/P[01]-|\bP[01]\s*Badge)/i;
 // Bot logins whose structured verdicts the gate accepts.
 const CODEX_BOT = 'chatgpt-codex-connector[bot]';
@@ -140,6 +142,11 @@ function agentSafe({ headRef, files, policy, issue }) {
     // A test moved out of test discovery is a removed test, and the
     // removal/skip checks apply when either side of a rename is a test.
     if (f.previous_filename && isTest(f.previous_filename) && !isTest(f.filename)) return { ok: false, why: `test file moved out of tests: ${f.previous_filename}` };
+    // Language-agnostic backstop: whatever the file type, a removed test or
+    // assertion line, or an added skip, is never agent-safe (inline tests such as
+    // Rust #[test] or a test file this list doesn't recognise are still caught).
+    if (REMOVED_TEST_LINE.test(f.patch || '')) return { ok: false, why: `test or assertion line removed in ${f.filename}` };
+    if (ADDED_SKIP_LINE.test(f.patch || '')) return { ok: false, why: `test skipped or narrowed in ${f.filename}` };
     if (pathsOf(f).some(isTest)) {
       const c = classifyFile({ ...f, filename: pathsOf(f).find(isTest) });
       if (!c.low) return { ok: false, why: c.why };

@@ -342,3 +342,18 @@ test('lockfiles and package-manager config are never agent-safe (Codex P2)', () 
   assert.equal(g.classify({ author: 'dependabot[bot]', title: 'Bump x from 1.2.3 to 1.2.4', labels: [], commitAuthors: ['dependabot[bot]'], files: [f('.npmrc')] }).risk, 'normal');
   assert.equal(g.classify({ author: 'dependabot[bot]', title: 'Bump x from 1.2.3 to 1.2.4', labels: [], commitAuthors: ['dependabot[bot]'], files: [f('npm-shrinkwrap.json')] }).risk, 'low');
 });
+
+test('test removals are caught in any language and any file (Codex P2)', () => {
+  const c = (filename, patch) => g.classify({ ...agentPr, files: [f(filename, patch, { additions: 0, deletions: 5 })] }).risk;
+  assert.equal(c('internal/auth/login_test.go', '-func TestRejectInvalidToken(t *testing.T) {'), 'normal');
+  assert.equal(c('internal/auth/login.go', '-\tif err != nil { t.Fatal(err) }'), 'normal');
+  assert.equal(c('src/lib.rs', '-#[test]'), 'normal');
+  assert.equal(c('spec/user_spec.rb', "-  it 'works' do"), 'normal');
+  assert.equal(c('app/src/main/FooTest.kt', '-    @Test fun works() {}'), 'normal');
+  assert.equal(c('src/thing.go', '+\tt.Skip("later")'), 'normal');
+  assert.equal(c('src/a.py', '+@pytest.mark.xfail'), 'normal');
+  // ordinary code edits still qualify
+  assert.equal(c('src/app.ts', '-const x = 1;\n+const x = 2;'), 'agent');
+  // Go test files are recognised as tests (added tests alone are low risk)
+  assert.equal(g.classify({ ...base, files: [f('pkg/a_test.go', '+func TestNew(t *testing.T) {}')] }).risk, 'low');
+});
