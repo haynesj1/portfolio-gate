@@ -129,6 +129,11 @@ test('caller only uses triggers that run default-branch code, and calls the gate
   for (const bad of ['pull_request_review', 'workflow_dispatch', 'push:', '\n  pull_request:', 'workflow_run']) assert.ok(!on.includes(bad), bad);
   assert.ok(on.includes('pull_request_target') && on.includes('issue_comment'));
   assert.match(caller, /uses: haynesj1\/portfolio-gate\/\.github\/workflows\/gate\.yml@main/);
+  // Comment runs are filtered to review results, and concurrency sits on the job so a
+  // skipped comment run can't cancel a real evaluation (Actions minutes, Nov 2026).
+  const job = caller.slice(caller.indexOf('\njobs:'));
+  for (const want of ["'review-verdict:v1'", "'codex-review-state:v1'", `'"status":"completed"'`, 'concurrency:', 'cancel-in-progress: true']) assert.ok(job.includes(want), want);
+  assert.ok(!caller.slice(0, caller.indexOf('\njobs:')).includes('concurrency:'), 'no workflow-level concurrency');
   // The reusable workflow can only be called, never triggered directly.
   const on2 = yml.slice(yml.indexOf('\non:'), yml.indexOf('\njobs:'));
   assert.equal(on2.trim(), 'on:\n  workflow_call:');

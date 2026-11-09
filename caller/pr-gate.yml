@@ -20,13 +20,21 @@ permissions:
   issues: write
   statuses: write
 
-concurrency:
-  # One run per PR at a time; a newer run cancels an older one. Every run
-  # recomputes everything from current GitHub state.
-  group: pr-gate-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: true
-
 jobs:
   evaluate:
-    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    # Comments only matter to the gate when they carry a review result: a completed
+    # Codex review summary or a Claude review-verdict. Every other comment (replies,
+    # PR summaries, Codex's "running" edits) is skipped here, and a skipped job uses
+    # no Actions minutes. PR events (push, labels, ready) always evaluate.
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request &&
+       (contains(github.event.comment.body, 'review-verdict:v1') ||
+        (contains(github.event.comment.body, 'codex-review-state:v1') &&
+         contains(github.event.comment.body, '"status":"completed"'))))
+    # One evaluation per PR at a time; a newer one cancels an older one. Set on the
+    # job, not the workflow, so a skipped comment run never cancels a real one.
+    concurrency:
+      group: pr-gate-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
     uses: haynesj1/portfolio-gate/.github/workflows/gate.yml@main
