@@ -132,9 +132,41 @@ test('caller only uses triggers that run default-branch code, and calls the gate
   // Comment runs are filtered to review results, and concurrency sits on the job so a
   // skipped comment run can't cancel a real evaluation (Actions minutes, Nov 2026).
   const job = caller.slice(caller.indexOf('\njobs:'));
-  for (const want of ["'review-verdict:v1'", "'codex-review-state:v1'", `'"status":"completed"'`, 'concurrency:', 'cancel-in-progress: true']) assert.ok(job.includes(want), want);
+  for (const want of ["'review-verdict:v1'", "'codex-review-state:v1'", 'concurrency:', 'cancel-in-progress: true']) assert.ok(job.includes(want), want);
   assert.ok(!caller.slice(0, caller.indexOf('\njobs:')).includes('concurrency:'), 'no workflow-level concurrency');
   // The reusable workflow can only be called, never triggered directly.
   const on2 = yml.slice(yml.indexOf('\non:'), yml.indexOf('\njobs:'));
   assert.equal(on2.trim(), 'on:\n  workflow_call:');
+});
+
+// The caller's job-level `if` decides which comment events evaluate the gate. Evaluate
+// the real expression against real comment bodies: GitHub's syntax here (&&, ||, !,
+// !=, 'strings', property paths) is valid JavaScript once contains() is provided.
+test('caller comment filter: review results evaluate, other comments are skipped', () => {
+  const callerYml = fs.readFileSync(path.join(__dirname, '..', 'caller', 'pr-gate.yml'), 'utf8');
+  const lines = callerYml.split('\n');
+  const start = lines.findIndex((l) => /^\s+if: >-$/.test(l));
+  const expr = lines.slice(start + 1).filter((l, i, a) => a.slice(0, i + 1).every((x) => /^\s{6}/.test(x))).join(' ');
+  const contains = (hay, needle) => String(hay ?? '').toLowerCase().includes(String(needle).toLowerCase());
+  const run = (github) => Boolean(new Function('github', 'contains', `return (${expr});`)(github, contains));
+  const onComment = (body, pr = true) => run({ event_name: 'issue_comment', event: { issue: pr ? { pull_request: { url: 'x' } } : {}, comment: { body } } });
+  const codex = (state) => `<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 ${state} -->\n<details>Codex Review Summary</details>`;
+  // Real Codex summaries (Nov 2026 format, no spaces) and other valid spellings.
+  assert.equal(onComment(codex('{"code_review":{"commit_sha":"abc","has_any_findings":false,"has_unresolved_findings":false,"status":"completed"},"security_review":{"status":null}}')), true);
+  assert.equal(onComment(codex('{"code_review":{"commit_sha":"abc","has_unresolved_findings":true,"status":"completed"}}')), true);
+  assert.equal(onComment(codex('{"code_review": {"commit_sha": "abc", "has_unresolved_findings": false, "status": "completed"}}')), true);
+  assert.equal(onComment(codex('{"code_review":{"commit_sha":"abc","has_unresolved_findings":false,"status":"succeeded"}}')), true);
+  assert.equal(onComment(codex('{"code_review":{"commit_sha":"abc","has_unresolved_findings":false,"status":"success"}}')), true);
+  // Still running: skipped, in either spacing.
+  assert.equal(onComment(codex('{"code_review":{"commit_sha":"abc","has_any_findings":null,"status":"running"}}')), false);
+  assert.equal(onComment(codex('{"code_review": {"commit_sha": "abc", "status": "running"}}')), false);
+  // Claude reviewer verdicts evaluate.
+  assert.equal(onComment('<!-- review-verdict:v1 {"commit_sha":"abc","result":"clear"} -->'), true);
+  assert.equal(onComment('<!-- review-verdict:v1 {"commit_sha":"abc","result":"blocking"} -->'), true);
+  // Ordinary comments, PR summaries and comments on plain issues are skipped.
+  assert.equal(onComment('Fixed in the latest push.'), false);
+  assert.equal(onComment('<!-- pr-summary:v1 -->\n## Summary for Jordan'), false);
+  assert.equal(onComment(codex('{"code_review":{"status":"completed"}}'), false), false);
+  // PR events always evaluate.
+  for (const event_name of ['pull_request_target']) assert.equal(run({ event_name, event: {} }), true);
 });

@@ -22,16 +22,21 @@ permissions:
 
 jobs:
   evaluate:
-    # Comments only matter to the gate when they carry a review result: a completed
-    # Codex review summary or a Claude review-verdict. Every other comment (replies,
-    # PR summaries, Codex's "running" edits) is skipped here, and a skipped job uses
-    # no Actions minutes. PR events (push, labels, ready) always evaluate.
+    # Comments only matter to the gate when they carry a review result: a Codex
+    # review summary or a Claude review-verdict. Other comments (replies, PR
+    # summaries, triage notes) are skipped, and a skipped job uses no Actions
+    # minutes. Codex summaries are skipped only while plainly still running, in
+    # either JSON spacing; any other status (completed, succeeded, success, or a
+    # format we don't recognise) evaluates, so the filter can only fail towards an
+    # extra run, never a missed one. PR events (push, labels, ready) always evaluate.
+    # Tested in gate/workflow.test.js ("caller comment filter").
     if: >-
       github.event_name != 'issue_comment' ||
       (github.event.issue.pull_request &&
        (contains(github.event.comment.body, 'review-verdict:v1') ||
         (contains(github.event.comment.body, 'codex-review-state:v1') &&
-         contains(github.event.comment.body, '"status":"completed"'))))
+         !contains(github.event.comment.body, '"status":"running"') &&
+         !contains(github.event.comment.body, '"status": "running"'))))
     # One evaluation per PR at a time; a newer one cancels an older one. Set on the
     # job, not the workflow, so a skipped comment run never cancels a real one.
     concurrency:
