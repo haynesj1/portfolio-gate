@@ -20,13 +20,27 @@ permissions:
   issues: write
   statuses: write
 
-concurrency:
-  # One run per PR at a time; a newer run cancels an older one. Every run
-  # recomputes everything from current GitHub state.
-  group: pr-gate-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: true
-
 jobs:
   evaluate:
-    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    # Comments only matter to the gate when they carry a review result: a Codex
+    # review summary (any state) or a Claude review-verdict. Other comments
+    # (replies, PR summaries, triage notes) are skipped, and a skipped job uses no
+    # Actions minutes. Codex summaries always evaluate, whatever their status or
+    # JSON spacing: the gate's own parser decides what they mean, so this filter
+    # can never hide a review result. PR events (push, labels, ready) always
+    # evaluate. An edit that removes a review result also evaluates (the previous
+    # body is checked too), so withdrawn evidence is recomputed at once.
+    # Tested in gate/workflow.test.js ("caller comment filter").
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request &&
+       (contains(github.event.comment.body, 'review-verdict:v1') ||
+        contains(github.event.comment.body, 'codex-review-state:v1') ||
+        contains(github.event.changes.body.from, 'review-verdict:v1') ||
+        contains(github.event.changes.body.from, 'codex-review-state:v1')))
+    # One evaluation per PR at a time; a newer one cancels an older one. Set on the
+    # job, not the workflow, so a skipped comment run never cancels a real one.
+    concurrency:
+      group: pr-gate-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
     uses: haynesj1/portfolio-gate/.github/workflows/gate.yml@main
