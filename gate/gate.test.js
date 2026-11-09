@@ -333,3 +333,12 @@ test('on a Codex PR, a claude[bot] P0/P1 line finding blocks through the second 
   assert.equal(g.secondReview({ headRef: 'codex/7', feedback: [line, verdictBy('claude[bot]', 'H', 'clear')], headSha: 'H', owner: OWNER }), 'blocking');
   assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), line, verdictBy(OWNER, 'H', 'clear')] }).state, 'failure');
 });
+
+test('lockfiles and package-manager config are never agent-safe (Codex P2)', () => {
+  for (const name of ['npm-shrinkwrap.json', 'app/npm-shrinkwrap.json', 'bun.lockb', 'poetry.lock', 'go.sum', 'Cargo.lock', '.npmrc', '.yarnrc.yml', 'pnpm-workspace.yaml', '.nvmrc', 'gradle/wrapper/gradle-wrapper.properties', 'settings.gradle.kts']) {
+    assert.equal(g.classify({ ...agentPr, files: [f(name, '+x', { additions: 50 })] }).risk, 'normal', name);
+  }
+  // the Dependabot path still only accepts real manifests
+  assert.equal(g.classify({ author: 'dependabot[bot]', title: 'Bump x from 1.2.3 to 1.2.4', labels: [], commitAuthors: ['dependabot[bot]'], files: [f('.npmrc')] }).risk, 'normal');
+  assert.equal(g.classify({ author: 'dependabot[bot]', title: 'Bump x from 1.2.3 to 1.2.4', labels: [], commitAuthors: ['dependabot[bot]'], files: [f('npm-shrinkwrap.json')] }).risk, 'low');
+});

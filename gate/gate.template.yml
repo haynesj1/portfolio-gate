@@ -128,6 +128,14 @@ __GATE_JS__
                 `risk: ${result.risk} (${result.reasons.join('; ')})`, `review: ${result.review}`, `human-approved: ${result.approved}`,
               ]).write();
             }
+            if (context.eventName === 'push') {
+              // The agent-safe policy (.ops.yml) changed. Only a push to the default
+              // branch counts; re-evaluate every open agent PR under the new policy.
+              if (context.ref !== `refs/heads/${context.payload.repository?.default_branch}`) return;
+              const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
+              for (const p of open.filter((x) => /^(claude|codex)\//.test(x.head.ref))) await evaluate(p.number);
+              return;
+            }
             if (context.eventName === 'issues') {
               // An issue changed (closed, reopened, ready / in-progress / pivotal
               // label): re-evaluate the open PRs that implement it, because the

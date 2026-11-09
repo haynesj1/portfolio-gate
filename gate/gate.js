@@ -18,9 +18,18 @@ const TEST_PATH = [
 ];
 const DOC_PATH = [/\.md$/, /^docs\//];
 const DEPENDENCY_FILES = [
-  /(^|\/)package(-lock)?\.json$/, /(^|\/)pnpm-lock\.yaml$/, /(^|\/)yarn\.lock$/,
-  /(^|\/)uv\.lock$/, /(^|\/)pyproject\.toml$/, /(^|\/)requirements[^/]*\.txt$/,
-  /(^|\/)gradle\/libs\.versions\.toml$/, /(^|\/)build\.gradle(\.kts)?$/,
+  /(^|\/)package(-lock)?\.json$/, /(^|\/)npm-shrinkwrap\.json$/, /(^|\/)pnpm-lock\.yaml$/, /(^|\/)yarn\.lock$/,
+  /(^|\/)bun\.lockb?$/, /(^|\/)uv\.lock$/, /(^|\/)poetry\.lock$/, /(^|\/)Pipfile(\.lock)?$/,
+  /(^|\/)pyproject\.toml$/, /(^|\/)requirements[^/]*\.(txt|in)$/, /(^|\/)setup\.(py|cfg)$/,
+  /(^|\/)gradle\/libs\.versions\.toml$/, /(^|\/)(build|settings)\.gradle(\.kts)?$/, /(^|\/)gradle\.lockfile$/,
+  /(^|\/)Gemfile(\.lock)?$/, /(^|\/)go\.(mod|sum)$/, /(^|\/)Cargo\.(toml|lock)$/,
+];
+// Package-manager configuration (registries, install scripts, workspaces, tool
+// versions). Not a Dependabot manifest, but never agent-safe either.
+const PACKAGE_CONFIG_FILES = [
+  /(^|\/)\.npmrc$/, /(^|\/)\.yarnrc(\.yml)?$/, /(^|\/)\.pnpmfile\.cjs$/, /(^|\/)pnpm-workspace\.yaml$/,
+  /(^|\/)\.nvmrc$/, /(^|\/)\.node-version$/, /(^|\/)\.python-version$/, /(^|\/)\.tool-versions$/,
+  /(^|\/)pip\.conf$/, /(^|\/)gradle\.properties$/, /(^|\/)gradle\/wrapper\//,
 ];
 // A removed line in a test file that looks like a test or an assertion.
 const REMOVED_TEST_LINE = /^-(?!--).*(\b(it|test|describe)\s*\(|def test_|@Test\b|\bexpect\s*\(|\bassert)/m;
@@ -36,6 +45,7 @@ const isProtected = (f) => PROTECTED.some((r) => r.test(f));
 const isTest = (f) => TEST_PATH.some((r) => r.test(f));
 const isDoc = (f) => DOC_PATH.some((r) => r.test(f));
 const isDependencyFile = (f) => DEPENDENCY_FILES.some((r) => r.test(f));
+const isPackageConfig = (f) => PACKAGE_CONFIG_FILES.some((r) => r.test(f));
 
 function classifyFile(file) {
   const { filename, status, patch = '' } = file;
@@ -123,7 +133,7 @@ function agentSafe({ headRef, files, policy, issue }) {
   for (const f of files) {
     // A rename touches two paths: both must be allowed.
     for (const name of pathsOf(f)) {
-      if (isDependencyFile(name)) return { ok: false, why: `dependency file ${name}` };
+      if (isDependencyFile(name) || isPackageConfig(name)) return { ok: false, why: `dependency or package-manager file ${name}` };
       if (matchesAny(name, policy.sensitive)) return { ok: false, why: `sensitive path ${name}` };
       if (matchesAny(name, policy.pivotal)) return { ok: false, why: `pivotal path ${name}` };
     }

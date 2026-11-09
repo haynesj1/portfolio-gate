@@ -2,7 +2,7 @@
 # portfolio-ops; do not edit in app repos.
 #
 # Only triggers that run the DEFAULT-BRANCH copy of this file are used
-# (pull_request_target, issue_comment, issues), so a PR cannot change the gate that
+# (pull_request_target, issue_comment, issues, push to the default branch), so a PR cannot change the gate that
 # judges it. Reviews are detected through comments: Codex edits its summary
 # comment; the Claude reviewer posts a review-verdict comment.
 name: pr-gate
@@ -17,6 +17,11 @@ on:
   # so changes to it re-evaluate the PRs that implement it.
   issues:
     types: [closed, reopened, labeled, unlabeled]
+  # A change to .ops.yml on the default branch (the agent-safe policy) re-evaluates
+  # every open agent PR, so tightening the policy withdraws earlier passes.
+  push:
+    branches: [main, master]
+    paths: ['.ops.yml']
 
 permissions:
   actions: read
