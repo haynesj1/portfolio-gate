@@ -226,6 +226,24 @@ jobs:
                 return verdicts.includes('clear') ? 'clear' : 'missing';
               }
 
+              // Second review for Codex-written PRs (portfolio-ops decision 0006). Codex
+              // reviews every PR, so a `codex/` PR also needs a Claude review-verdict for its
+              // head commit. Claude review sessions post through the owner's account, so a
+              // verdict from the owner counts here (and only here) as well as one from
+              // claude[bot]. Forging it can only reduce a Codex PR to Codex-only review (the
+              // position before this rule); Codex's own clean review is still required, and
+              // owner-account verdicts never count for any other PR.
+              function secondReview({ headRef, feedback, headSha, owner }) {
+                if (!/^codex\//.test(headRef || '')) return 'not-needed';
+                const results = feedback
+                  .filter((x) => x.author === 'claude[bot]' || (owner && x.author === owner))
+                  .map((x) => parse(VERDICT, x.body))
+                  .filter((v) => v && v.commit_sha === headSha)
+                  .map((v) => v.result);
+                if (results.includes('blocking')) return 'blocking';
+                return results.includes('clear') ? 'clear' : 'missing';
+              }
+
               // Approval: the latest `labeled` event for human-approved must be by the
               // owner, done directly (not via a GitHub App such as an agent), and later than
               // both (a) when THIS PR adopted its head commit, i.e. the earliest pr-gate run
@@ -251,19 +269,24 @@ jobs:
                 const overridden = raw === 'blocking' && reviewOverridden(input);
                 const review = overridden ? 'clear' : raw;
                 const approved = humanApproved(input);
+                const second = secondReview(input);
+                // review:override (owner, same rules as approval) also overrules a blocking Claude review.
+                const overridden2 = second === 'blocking' && reviewOverridden(input);
                 let state; let description;
                 if (input.draft) { state = 'pending'; description = 'Draft PR'; }
                 else if (review === 'blocking') { state = 'failure'; description = 'Reviewer found P0/P1 issues on this commit (or review:blocking)'; }
                 else if (review === 'missing') { state = 'pending'; description = 'Waiting for a completed review of this commit'; }
+                else if (second === 'blocking' && !overridden2) { state = 'failure'; description = 'Claude review of this Codex PR found P0/P1 issues'; }
+                else if (second === 'missing') { state = 'pending'; description = 'Codex PR: waiting for the Claude review of this commit'; }
                 else if (risk === 'low') { state = 'success'; description = overridden ? 'risk:low; review findings overridden by owner' : 'risk:low and reviewed'; }
                 else if (risk === 'agent') { state = 'success'; description = overridden ? 'risk:agent; review findings overridden by owner' : 'risk:agent (agent-safe) and reviewed'; }
                 else if (approved) { state = 'success'; description = overridden ? 'human-approved; review findings overridden by owner' : 'human-approved and reviewed'; }
                 else if (input.labels.includes('human-approved')) { state = 'pending'; description = 'risk:normal: approval predates this commit; remove and re-add human-approved'; }
                 else { state = 'pending'; description = 'risk:normal: waiting for human-approved'; }
-                return { risk, reasons, review, overridden, approved, state, description };
+                return { risk, reasons, review, secondReview: second, overridden, approved, state, description };
               }
 
-              module.exports = { ACTIONS_BOT, pathsOf, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
+              module.exports = { ACTIONS_BOT, secondReview, pathsOf, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
 
               return module.exports; })();
             const { owner, repo } = context.repo;

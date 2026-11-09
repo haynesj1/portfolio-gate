@@ -8,6 +8,12 @@ A merge gate for repositories where AI coding agents open pull requests. It sets
    - **the change is agent-safe** (`risk:agent`, opt-in per repo, see below);
    - **the repository owner has approved this exact commit** with the `human-approved` label (`risk:normal`).
 
+## Codex-written PRs need a second review
+
+Codex reviews every PR, so a PR on a `codex/` branch also needs a Claude `review-verdict:v1` for its head commit (`clear` to pass; `blocking` fails unless the owner adds `review:override`). The portfolio-ops dispatcher starts a Claude review session for each such PR. Those sessions post through the owner's account, so on `codex/` PRs only, an owner-account verdict counts as well as one from `claude[bot]`.
+
+Because agents act as the owner, a forged verdict is possible. It can only reduce a Codex PR to Codex-only review, which was the position before this rule. Codex's own clean review is still required, and owner-account verdicts never count on any other PR (portfolio-ops decision 0006).
+
 ## Agent-safe tier (`risk:agent`)
 
 Off unless the repo's `.ops.yml` **on the default branch** says `agent_safe: true` (the gate never reads the PR's copy, and `.ops.yml` is a protected path). A PR is agent-safe only if all of these hold:

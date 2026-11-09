@@ -230,3 +230,33 @@ test('renames are judged on both the old and the new path (Codex P1)', () => {
   assert.equal(g.classify({ ...base, files: [ren('src/x.ts', 'docs/x.md')] }).risk, 'normal');
   assert.equal(g.classify({ ...base, files: [ren('docs/a.md', 'docs/b.md')] }).risk, 'low');
 });
+
+// ---- second review for Codex PRs (portfolio-ops decision 0006) ------------
+const verdictBy = (author, sha, result) => ({ author, body: `<!-- review-verdict:v1 {"commit_sha":"${sha}","result":"${result}"} -->` });
+const codexPr = { ...agentPr, headRef: 'codex/7' };
+
+test('codex PRs need a Claude review-verdict for the head commit as well as Codex', () => {
+  assert.equal(g.decide(codexPr).state, 'pending');
+  assert.match(g.decide(codexPr).description, /waiting for the Claude review/);
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), verdictBy(OWNER, 'H', 'clear')] }).state, 'success');
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), verdictBy('claude[bot]', 'H', 'clear')] }).state, 'success');
+  // verdict for an older commit doesn't count; a blocking one fails
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), verdictBy(OWNER, 'OLD', 'clear')] }).state, 'pending');
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), verdictBy(OWNER, 'H', 'blocking')] }).state, 'failure');
+  // Codex's own review is still required
+  assert.equal(g.decide({ ...codexPr, feedback: [verdictBy(OWNER, 'H', 'clear')] }).state, 'pending');
+  // someone else's verdict doesn't count
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), verdictBy('someone', 'H', 'clear')] }).state, 'pending');
+});
+
+test('owner-account verdicts count only on codex/ PRs; Claude PRs are unchanged', () => {
+  assert.equal(g.secondReview({ headRef: 'claude/7', feedback: [], headSha: 'H', owner: OWNER }), 'not-needed');
+  assert.equal(g.decide(agentPr).state, 'success');
+  // an owner "clear" can't stand in for Codex's review on a Claude PR
+  assert.equal(g.decide({ ...agentPr, feedback: [verdictBy(OWNER, 'H', 'clear')] }).state, 'pending');
+});
+
+test('review:override by the owner overrules a blocking Claude review of a Codex PR', () => {
+  const over = { ...codexPr, labels: ['review:override'], feedback: [codex('H'), verdictBy(OWNER, 'H', 'blocking')], labelEvents: [{ event: 'labeled', label: 'review:override', actor: OWNER, viaApp: false, at: '2026-11-06T11:00:00Z' }] };
+  assert.equal(g.decide(over).state, 'success');
+});
