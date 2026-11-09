@@ -84,11 +84,12 @@ jobs:
                   // sensitive paths must not drop the second one).
                   if (/^\s*(#.*)?$/.test(raw)) continue;
                   const line = raw.replace(/\s+#.*$/, '');
-                  const item = /^\s+-\s*["']?([^"']+?)["']?\s*$/.exec(line);
+                  // List items, indented or not (YAML allows `key:\n- item`).
+                  const item = /^\s*-\s*["']?([^"']+?)["']?\s*$/.exec(line);
                   if (item && list) { policy[list].push(item[1]); continue; }
-                  // Anything else indented inside a list is syntax this parser doesn't read:
-                  // fail closed (tier off) rather than silently lose a restriction.
-                  if (list && /^\s/.test(line)) return { ...policy, agentSafe: false, invalid: `unreadable line in ${list} list: ${line.trim()}` };
+                  // Anything else inside a list that isn't a new top-level key is syntax this
+                  // parser doesn't read: fail closed (tier off) rather than lose a restriction.
+                  if (list && (/^\s/.test(line) || !/^[a-z_]+:/.test(line))) return { ...policy, agentSafe: false, invalid: `unreadable line in ${list} list: ${line.trim()}` };
                   list = null;
                   const kv = /^([a-z_]+):\s*(.*)$/.exec(line);
                   if (!kv) continue;
@@ -147,8 +148,11 @@ jobs:
                     if (matchesAny(name, policy.sensitive)) return { ok: false, why: `sensitive path ${name}` };
                     if (matchesAny(name, policy.pivotal)) return { ok: false, why: `pivotal path ${name}` };
                   }
-                  if (isTest(f.filename)) {
-                    const c = classifyFile(f);
+                  // A test moved out of test discovery is a removed test, and the
+                  // removal/skip checks apply when either side of a rename is a test.
+                  if (f.previous_filename && isTest(f.previous_filename) && !isTest(f.filename)) return { ok: false, why: `test file moved out of tests: ${f.previous_filename}` };
+                  if (pathsOf(f).some(isTest)) {
+                    const c = classifyFile({ ...f, filename: pathsOf(f).find(isTest) });
                     if (!c.low) return { ok: false, why: c.why };
                   } else if (f.status === 'removed') return { ok: false, why: `file deleted: ${f.filename}` };
                 }
@@ -215,13 +219,18 @@ jobs:
               // feedback: comments and reviews ({ author, body, commitId? }). Review and
               // line comments carry commitId; a P0/P1 finding from a reviewer bot on the
               // head commit blocks even if a summary says otherwise.
-              function reviewState({ labels, feedback, headSha }) {
+              function reviewState({ labels, feedback, headSha, headRef }) {
                 if (labels.includes('review:blocking')) return 'blocking';
+                // On a Codex-written PR the primary review must be Codex's own; a Claude
+                // verdict is the separate second review (secondReview), never both.
+                const codexPr = /^codex\//.test(headRef || '');
                 // Codex's summary tracks whether its findings are resolved, so it is
                 // authoritative for Codex; raw P0/P1 line findings only count for others.
                 const findings = feedback.filter((x) => VERDICT_BOTS.has(x.author) && x.author !== CODEX_BOT && x.commitId === headSha && BLOCKING_FINDING.test(x.body || ''));
-                const verdicts = feedback.map((x) => verdictFor(x, headSha)).filter(Boolean);
-                if (findings.length || verdicts.includes('blocking')) return 'blocking';
+                const verdicts = feedback.filter((x) => !codexPr || x.author === CODEX_BOT).map((x) => verdictFor(x, headSha)).filter(Boolean);
+                // A blocking Claude verdict still blocks on a Codex PR (via secondReview too).
+                const claudeBlocks = codexPr && feedback.some((x) => x.author !== CODEX_BOT && verdictFor(x, headSha) === 'blocking');
+                if (findings.length || claudeBlocks || verdicts.includes('blocking')) return 'blocking';
                 if (verdicts.includes('pending')) return 'missing';
                 return verdicts.includes('clear') ? 'clear' : 'missing';
               }

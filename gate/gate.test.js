@@ -267,3 +267,29 @@ test('the owner approving a Codex PR stands in for a missing Claude review, not 
   assert.equal(g.decide({ ...approvedPr, feedback: [] }).state, 'pending');
   assert.equal(g.decide({ ...approvedPr, feedback: [codex('H'), verdictBy(OWNER, 'H', 'blocking')] }).state, 'failure');
 });
+
+// ---- second-round Codex findings --------------------------------------------
+test('renaming a test out of test discovery is not agent-safe (Codex P2)', () => {
+  const ren = (from, to, patch = '+x') => f(to, patch, { status: 'renamed', previous_filename: from });
+  const c = (files) => g.classify({ ...agentPr, files }).risk;
+  assert.equal(c([ren('tests/auth.test.ts', 'src/helper.ts')]), 'normal');
+  assert.equal(c([ren('src/a.test.ts', 'src/b.test.ts', "-it('x', () => {})")]), 'normal');
+  assert.equal(c([ren('src/a.test.ts', 'src/b.test.ts')]), 'low'); // a plain test rename is already low risk
+});
+
+test('indentless YAML list items are read; stray lines turn the tier off (Codex P1)', () => {
+  const p = g.parseOpsPolicy('agent_safe: true\nsensitive_paths:\n- src/auth/**\n- "db/"\npivotal_paths:\n- src/reveal/**\n');
+  assert.deepEqual(p.sensitive, ['src/auth/**', 'db/']);
+  assert.deepEqual(p.pivotal, ['src/reveal/**']);
+  assert.equal(g.classify({ ...agentPr, policy: p, files: [f('src/auth/login.ts')] }).risk, 'normal');
+  assert.equal(g.parseOpsPolicy('agent_safe: true\nsensitive_paths:\n- a/**\nnot a key\n').agentSafe, false);
+});
+
+test('on a Codex PR a Claude verdict alone never stands in for Codex review (Codex P2)', () => {
+  const only = { ...codexPr, feedback: [verdictBy('claude[bot]', 'H', 'clear')] };
+  assert.equal(g.reviewState(only), 'missing');
+  assert.equal(g.decide(only).state, 'pending');
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), verdictBy('claude[bot]', 'H', 'clear')] }).state, 'success');
+  // Claude PRs: a claude[bot] verdict still counts as a review, as before
+  assert.equal(g.reviewState({ ...agentPr, feedback: [verdictBy('claude[bot]', 'H', 'clear')] }), 'clear');
+});

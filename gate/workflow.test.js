@@ -219,3 +219,8 @@ test('workflow: an issue event re-evaluates only the open PRs that implement it'
   assert.equal(h.gate().state, 'pending');
   assert.deepEqual(h.added, ['risk:normal']);
 });
+
+test('caller: PR body edits re-evaluate (the linked issue can live in the body)', () => {
+  const callerYml = fs.readFileSync(path.join(__dirname, '..', 'caller', 'pr-gate.yml'), 'utf8');
+  assert.match(callerYml, /pull_request_target:\n(\s+#.*\n)*\s+types: \[opened, edited,/);
+});

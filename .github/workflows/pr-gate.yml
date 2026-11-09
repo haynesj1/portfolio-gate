@@ -9,7 +9,8 @@ name: pr-gate
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review, converted_to_draft]
+    # edited: the PR body can carry the linked issue (`Closes #n`) for the agent-safe tier.
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled, ready_for_review, converted_to_draft]
   issue_comment:
     types: [created, edited]
   # The agent-safe tier depends on the linked issue (open, queued, not pivotal),
