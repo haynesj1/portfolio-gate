@@ -302,9 +302,10 @@ jobs:
 
               return module.exports; })();
             const { owner, repo } = context.repo;
-            async function evaluate(number) {
+            // Reads every input the gate decides on, fresh from GitHub.
+            async function gather(number) {
               const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
-              if (pr.state !== 'open') return;
+              if (pr.state !== 'open') return null;
               const headSha = pr.head.sha;
               const list = (fn, args) => github.paginate(fn, { owner, repo, per_page: 100, ...args });
               const files = await list(github.rest.pulls.listFiles, { pull_number: number });
@@ -366,6 +367,12 @@ jobs:
                 headAdoptedAt: adopted[0],
                 forcePushTimes,
               };
+              return input;
+            }
+            async function evaluate(number) {
+              let input = await gather(number);
+              if (!input) return;
+              const headSha = input.headSha;
               const publish = async (result, labels) => {
                 core.info(JSON.stringify({ ...result, headAdoptedAt: input.headAdoptedAt }, null, 2));
                 const want = `risk:${result.risk}`;
@@ -383,22 +390,20 @@ jobs:
               };
               let result = gate.decide(input);
               await publish(result, input.labels);
-              // Write, then verify: a run that published an agent-safe pass re-reads
-              // everything that pass depends on: the PR (its head commit, branch and
-              // body, hence which issue it links) and that issue. If anything changed
-              // meanwhile (an edited `Closes #n`, a closed, unqueued or pivotal issue),
-              // recompute and publish again. Whichever run writes last has therefore
-              // seen every change, so an older run can't leave a stale pass behind.
-              for (let i = 0; i < 3 && result.risk === 'agent'; i++) {
-                const { data: fresh } = await github.rest.pulls.get({ owner, repo, pull_number: number });
-                if (fresh.head.sha !== headSha) break; // a new commit gets its own evaluation and status
-                const freshIssue = await readIssue(gate.linkedIssue(fresh.head.ref, fresh.body));
-                if (fresh.head.ref === input.headRef && JSON.stringify(freshIssue) === JSON.stringify(input.issue)) break;
-                const labels = [`risk:${result.risk}`, ...input.labels.filter((l) => !/^risk:/.test(l))];
-                input.headRef = fresh.head.ref;
-                input.issue = freshIssue;
-                result = gate.decide(input);
-                await publish(result, labels);
+              // Write, then verify. Runs for the same PR can overlap (PR, comment and
+              // issue events use different concurrency groups), so an older run could
+              // publish a pass after a newer one published a block or a revocation.
+              // After publishing a pass, re-gather EVERY input from GitHub and decide
+              // again; if the answer changed, publish that instead. Whichever run
+              // writes last has therefore read all inputs after the last change.
+              for (let i = 0; i < 3 && result.state === 'success'; i++) {
+                const fresh = await gather(number);
+                if (!fresh || fresh.headSha !== headSha) break; // closed, or a new commit with its own evaluation
+                const again = gate.decide(fresh);
+                if (again.state === result.state && again.risk === result.risk) break;
+                input = fresh;
+                result = again;
+                await publish(result, fresh.labels);
               }
               await core.summary.addHeading(`review-gate: ${result.state}`).addList([
                 `risk: ${result.risk} (${result.reasons.join('; ')})`, `review: ${result.review}`, `human-approved: ${result.approved}`,

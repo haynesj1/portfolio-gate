@@ -195,7 +195,7 @@ test('workflow: agent-safe PR passes without approval, reading .ops.yml from the
   await h.run();
   assert.equal(h.gate().state, 'success');
   assert.deepEqual(h.added, ['risk:agent']);
-  assert.deepEqual(h.seenRefs, ['main']);
+  assert.ok(h.seenRefs.length >= 1 && h.seenRefs.every((r) => r === 'main'));
 });
 
 test('workflow: without .ops.yml opt-in the same PR still needs approval', async () => {
@@ -262,4 +262,21 @@ test('workflow: the post-write check stops if a newer commit has arrived', async
   h.github.rest.pulls.get = async (a) => { const r = await get(a); return gets++ === 0 ? r : { data: { ...r.data, head: { ...r.data.head, sha: 'NEW' } } }; };
   await h.run();
   assert.equal(h.written.filter((x) => x.context === 'review-gate').length, 1);
+});
+
+test('workflow: after publishing a pass, a review:blocking label added meanwhile wins (Codex P2)', async () => {
+  const h = harness({ headRef: 'claude/7', ops: 'agent_safe: true\n', issue: { number: 7, state: 'open', labels: [{ name: 'ready' }] }, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  const get = h.github.rest.pulls.get; let gets = 0;
+  h.github.rest.pulls.get = async (a) => { const r = await get(a); return gets++ === 0 ? r : { data: { ...r.data, labels: [{ name: 'review:blocking' }] } }; };
+  await h.run();
+  assert.deepEqual(h.written.filter((x) => x.context === 'review-gate').map((x) => x.state), ['success', 'failure']);
+});
+
+test('workflow: a non-pass result is published once, with no re-check', async () => {
+  const h = harness({ comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  let gets = 0; const get = h.github.rest.pulls.get;
+  h.github.rest.pulls.get = async (a) => { gets++; return get(a); };
+  await h.run();
+  assert.equal(h.gate().state, 'pending');
+  assert.equal(gets, 1);
 });
