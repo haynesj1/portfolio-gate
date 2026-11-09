@@ -23,7 +23,7 @@ const labelled = (at, extra = {}) => ({ event: 'labeled', label: { name: 'human-
 const run = (sha, at, pr = 1, path = '.github/workflows/pr-gate.yml') => ({ head_sha: sha, created_at: at, path, pull_requests: [{ number: pr }] });
 const code = [{ filename: 'src/app.ts', status: 'modified', patch: '+x', additions: 1 }];
 
-function harness({ headSha = 'H', event = 'pull_request_target', action = 'synchronize', files = code, comments = [], timeline = [], runs = [], labels = [], headRef = 'feature', ops = null, issue = null }) {
+function harness({ headSha = 'H', event = 'pull_request_target', action = 'synchronize', files = code, comments = [], timeline = [], runs = [], labels = [], headRef = 'feature', ops = null, issue = null, openPrs = [], issueEvent = null }) {
   const written = []; const added = []; const seenRefs = [];
   const github = {
     paginate: async (fn, args) => fn(args),
@@ -31,6 +31,7 @@ function harness({ headSha = 'H', event = 'pull_request_target', action = 'synch
       pulls: {
         get: async () => ({ data: { state: 'open', draft: false, title: 't', body: '', user: { login: OWNER }, labels: labels.map((name) => ({ name })), head: { sha: headSha, ref: headRef }, base: { repo: { default_branch: 'main' } } } }),
         listFiles: async () => files,
+        list: async () => openPrs,
         listCommits: async () => [{ author: { login: OWNER } }],
         listReviews: async () => [],
         listReviewComments: async () => [],
@@ -51,7 +52,7 @@ function harness({ headSha = 'H', event = 'pull_request_target', action = 'synch
   };
   const context = {
     repo: { owner: OWNER, repo: 'r' }, eventName: event, serverUrl: 'https://github.com', runId: 42,
-    payload: { action, label: action === 'labeled' ? { name: 'human-approved' } : undefined, pull_request: { number: 1, updated_at: '2026-11-06T10:00:00Z' } },
+    payload: issueEvent || { action, label: action === 'labeled' ? { name: 'human-approved' } : undefined, pull_request: { number: 1, updated_at: '2026-11-06T10:00:00Z' } },
   };
   const core = { info() {}, warning() {}, summary: { addHeading() { return this; }, addList() { return this; }, write: async () => {} } };
   return { run: () => script(github, context, core), written, added, seenRefs, gate: () => written.filter((s) => s.context === 'review-gate').at(-1) };
@@ -180,6 +181,13 @@ test('caller comment filter: review results evaluate, other comments are skipped
   assert.equal(onComment('Fixed now.', true, 'Fixed in the latest push.'), false);
   // PR events always evaluate.
   for (const event_name of ['pull_request_target']) assert.equal(run({ event_name, event: {} }), true);
+  // Issue events evaluate only when they can change the agent-safe tier.
+  const onIssue = (action, label, pr = false) => run({ event_name: 'issues', event: { action, label: label ? { name: label } : undefined, issue: pr ? { pull_request: { url: 'x' } } : {} } });
+  assert.equal(onIssue('closed'), true);
+  assert.equal(onIssue('reopened'), true);
+  for (const l of ['ready', 'in-progress', 'pivotal']) { assert.equal(onIssue('labeled', l), true); assert.equal(onIssue('unlabeled', l), true); }
+  assert.equal(onIssue('labeled', 'size:S'), false);
+  assert.equal(onIssue('labeled', 'human-approved', true), false);
 });
 
 test('workflow: agent-safe PR passes without approval, reading .ops.yml from the default branch', async () => {
@@ -193,6 +201,21 @@ test('workflow: agent-safe PR passes without approval, reading .ops.yml from the
 test('workflow: without .ops.yml opt-in the same PR still needs approval', async () => {
   const h = harness({ headRef: 'claude/7', issue: { number: 7, state: 'open', labels: [{ name: 'ready' }] }, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
   await h.run();
+  assert.equal(h.gate().state, 'pending');
+  assert.deepEqual(h.added, ['risk:normal']);
+});
+
+test('workflow: an issue event re-evaluates only the open PRs that implement it', async () => {
+  const pr = (number, ref, body = '') => ({ number, head: { ref }, body });
+  const h = harness({
+    event: 'issues', headRef: 'claude/7', ops: 'agent_safe: true\n',
+    issue: { number: 7, state: 'open', labels: [{ name: 'ready' }, { name: 'pivotal' }] },
+    issueEvent: { action: 'labeled', label: { name: 'pivotal' }, issue: { number: 7 } },
+    openPrs: [pr(1, 'claude/7'), pr(2, 'claude/8')],
+    comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')],
+  });
+  await h.run();
+  assert.equal(h.written.length, 1);
   assert.equal(h.gate().state, 'pending');
   assert.deepEqual(h.added, ['risk:normal']);
 });

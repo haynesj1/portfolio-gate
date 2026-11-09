@@ -2,7 +2,7 @@
 # portfolio-ops; do not edit in app repos.
 #
 # Only triggers that run the DEFAULT-BRANCH copy of this file are used
-# (pull_request_target, issue_comment), so a PR cannot change the gate that
+# (pull_request_target, issue_comment, issues), so a PR cannot change the gate that
 # judges it. Reviews are detected through comments: Codex edits its summary
 # comment; the Claude reviewer posts a review-verdict comment.
 name: pr-gate
@@ -12,6 +12,10 @@ on:
     types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review, converted_to_draft]
   issue_comment:
     types: [created, edited]
+  # The agent-safe tier depends on the linked issue (open, queued, not pivotal),
+  # so changes to it re-evaluate the PRs that implement it.
+  issues:
+    types: [closed, reopened, labeled, unlabeled]
 
 permissions:
   actions: read
@@ -30,10 +34,16 @@ jobs:
     # can never hide a review result. PR events (push, labels, ready) always
     # evaluate. An edit that removes a review result also evaluates (the previous
     # body is checked too), so withdrawn evidence is recomputed at once.
+    # Issue events evaluate only when they can change the agent-safe tier: the
+    # issue closed or reopened, or its ready / in-progress / pivotal label changed.
     # Tested in gate/workflow.test.js ("caller comment filter").
     if: >-
-      github.event_name != 'issue_comment' ||
-      (github.event.issue.pull_request &&
+      (github.event_name != 'issue_comment' && github.event_name != 'issues') ||
+      (github.event_name == 'issues' && !github.event.issue.pull_request &&
+       (github.event.action == 'closed' || github.event.action == 'reopened' ||
+        github.event.label.name == 'ready' || github.event.label.name == 'in-progress' ||
+        github.event.label.name == 'pivotal')) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
        (contains(github.event.comment.body, 'review-verdict:v1') ||
         contains(github.event.comment.body, 'codex-review-state:v1') ||
         contains(github.event.changes.body.from, 'review-verdict:v1') ||

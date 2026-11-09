@@ -60,9 +60,15 @@ function parseOpsPolicy(text) {
   const policy = { agentSafe: false, maxLines: 400, sensitive: [], pivotal: [] };
   let list = null;
   for (const raw of String(text || '').split('\n')) {
-    const line = raw.replace(/\s+#.*$/, '').replace(/^#.*$/, '');
+    // Blank and comment-only lines never end a list (a comment between two
+    // sensitive paths must not drop the second one).
+    if (/^\s*(#.*)?$/.test(raw)) continue;
+    const line = raw.replace(/\s+#.*$/, '');
     const item = /^\s+-\s*["']?([^"']+?)["']?\s*$/.exec(line);
     if (item && list) { policy[list].push(item[1]); continue; }
+    // Anything else indented inside a list is syntax this parser doesn't read:
+    // fail closed (tier off) rather than silently lose a restriction.
+    if (list && /^\s/.test(line)) return { ...policy, agentSafe: false, invalid: `unreadable line in ${list} list: ${line.trim()}` };
     list = null;
     const kv = /^([a-z_]+):\s*(.*)$/.exec(line);
     if (!kv) continue;
@@ -71,8 +77,10 @@ function parseOpsPolicy(text) {
     else if (key === 'agent_max_lines' && /^\d+$/.test(value.trim())) policy.maxLines = Number(value.trim());
     else if (key === 'sensitive_paths' || key === 'pivotal_paths') {
       list = key === 'sensitive_paths' ? 'sensitive' : 'pivotal';
-      const inline = /^\[(.*)\]$/.exec(value.trim());
+      const v = value.trim();
+      const inline = /^\[(.*)\]$/.exec(v);
       if (inline) { policy[list].push(...inline[1].split(',').map((x) => x.trim().replace(/^["']|["']$/g, '')).filter(Boolean)); list = null; }
+      else if (v) return { ...policy, agentSafe: false, invalid: `unreadable value for ${key}` };
     }
   }
   return policy;
@@ -93,6 +101,7 @@ function globToRegExp(glob) {
   return new RegExp('^' + re + tail + '\u0024');
 }
 const matchesAny = (file, globs) => globs.some((g) => globToRegExp(g).test(file));
+const pathsOf = (f) => (f.previous_filename && f.previous_filename !== f.filename ? [f.filename, f.previous_filename] : [f.filename]);
 
 // The issue an agent PR implements: from a `claude/<n>` or `codex/<n>` branch,
 // else the first `Closes #n` in the body.
@@ -112,9 +121,12 @@ function agentSafe({ headRef, files, policy, issue }) {
   if (!issue.labels.includes('ready') && !issue.labels.includes('in-progress')) return { ok: false, why: 'linked issue was not queued (ready)' };
   if (issue.labels.includes('pivotal')) return { ok: false, why: 'linked issue is pivotal' };
   for (const f of files) {
-    if (isDependencyFile(f.filename)) return { ok: false, why: `dependency file ${f.filename}` };
-    if (matchesAny(f.filename, policy.sensitive)) return { ok: false, why: `sensitive path ${f.filename}` };
-    if (matchesAny(f.filename, policy.pivotal)) return { ok: false, why: `pivotal path ${f.filename}` };
+    // A rename touches two paths: both must be allowed.
+    for (const name of pathsOf(f)) {
+      if (isDependencyFile(name)) return { ok: false, why: `dependency file ${name}` };
+      if (matchesAny(name, policy.sensitive)) return { ok: false, why: `sensitive path ${name}` };
+      if (matchesAny(name, policy.pivotal)) return { ok: false, why: `pivotal path ${name}` };
+    }
     if (isTest(f.filename)) {
       const c = classifyFile(f);
       if (!c.low) return { ok: false, why: c.why };
@@ -133,9 +145,8 @@ function isPatchBump(title) {
 // commits: authors of every commit on the PR (logins), used so that code
 // pushed onto a Dependabot branch by anyone else loses the Dependabot path.
 function classify({ author, title, labels, files, commitAuthors = [], headRef, policy, issue }) {
-  if (files.some((f) => isProtected(f.filename))) {
-    return { risk: 'normal', reasons: files.filter((f) => isProtected(f.filename)).map((f) => `protected path ${f.filename}`) };
-  }
+  const protectedPaths = files.flatMap(pathsOf).filter(isProtected);
+  if (protectedPaths.length) return { risk: 'normal', reasons: protectedPaths.map((n) => `protected path ${n}`) };
   if (author === 'dependabot[bot]') {
     const onlyDependabot = commitAuthors.length > 0 && commitAuthors.every((a) => a === 'dependabot[bot]');
     const onlyManifests = files.every((f) => isDependencyFile(f.filename));
@@ -149,7 +160,8 @@ function classify({ author, title, labels, files, commitAuthors = [], headRef, p
       ? { risk: 'low', reasons: ['dead-code removal: deletions only, no files removed'] }
       : { risk: 'normal', reasons: ['dead-code PR adds lines or deletes whole files'] };
   }
-  const results = files.map(classifyFile);
+  // A renamed file is low risk only if its old path would be too (src/x.ts → docs/x.md is not docs).
+  const results = files.flatMap((f) => (pathsOf(f).length > 1 ? [classifyFile(f), classifyFile({ ...f, filename: f.previous_filename })] : [classifyFile(f)]));
   const blockers = results.filter((r) => !r.low).map((r) => r.why);
   if (!blockers.length) return { risk: 'low', reasons: [...new Set(results.map((r) => r.why))] };
   const safe = agentSafe({ headRef, files, policy, issue });
@@ -231,4 +243,4 @@ function decide(input) {
   return { risk, reasons, review, overridden, approved, state, description };
 }
 
-module.exports = { ACTIONS_BOT, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
+module.exports = { ACTIONS_BOT, pathsOf, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };

@@ -13,7 +13,7 @@ A merge gate for repositories where AI coding agents open pull requests. It sets
 Off unless the repo's `.ops.yml` **on the default branch** says `agent_safe: true` (the gate never reads the PR's copy, and `.ops.yml` is a protected path). A PR is agent-safe only if all of these hold:
 
 - its branch is `claude/…` or `codex/…`, and it implements a linked issue (`claude/<n>`, `codex/<n>`, or `Closes #n`) that is open, queued (`ready` or `in-progress`) and **not** labelled `pivotal`;
-- it touches no protected path, no dependency manifest, nothing under `sensitive_paths` or `pivotal_paths` from `.ops.yml`, and deletes no file;
+- it touches no protected path, no dependency manifest, nothing under `sensitive_paths` or `pivotal_paths` from `.ops.yml`, and deletes no file (a rename is checked on both its old and new path);
 - it deletes or skips no test or assertion;
 - it changes at most `agent_max_lines` lines (default 400);
 - a reviewer bot has cleared the head commit, as for every tier. CI checks are required separately by the repo's ruleset.
@@ -28,6 +28,10 @@ sensitive_paths:       # always need human-approved
 pivotal_paths:         # core-journey UI that the owner wants to see first
   - "src/routes/reveal/**"
 ```
+
+Policy parsing fails closed: blank lines and comments inside a path list are skipped, and any line the gate can't read switches the tier off for that repo (everything is `risk:normal`).
+
+Because the tier depends on the linked issue, the caller also listens to `issues` events (closed, reopened, or a `ready` / `in-progress` / `pivotal` label change) and re-evaluates the open PRs that implement that issue. Marking an issue `pivotal` therefore withdraws an earlier agent-safe pass at once. Merge this repo's gate change **before** syncing the caller to app repos, or the older gate will fail on issue events.
 
 Residual risk, accepted in portfolio-ops decision 0005: agents act with the owner's identity, so they can set issue labels such as `ready` or remove `pivotal`. The path, size and test rules and the review are the real controls; the daily merge audit and the dashboard's auto-merge digest catch the rest.
 

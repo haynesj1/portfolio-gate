@@ -195,3 +195,38 @@ test('agent-safe: in-progress issue still counts as queued; tests added alongsid
   assert.equal(g.classify({ ...agentPr, issue: { ...queued, labels: ['in-progress'] } }).risk, 'agent');
   assert.equal(g.classify({ ...agentPr, files: [f('src/a.ts'), f('src/a.test.ts', "+it('x', () => {})")] }).risk, 'agent');
 });
+
+test('agent-safe: comments and blank lines inside a path list keep the list going (Codex P1)', () => {
+  const p = g.parseOpsPolicy(`agent_safe: true
+sensitive_paths:
+  - "src/auth/**"
+
+  # payments too
+  - src/payments/**   # trailing comment
+pivotal_paths:
+  - src/routes/reveal/**
+`);
+  assert.deepEqual(p.sensitive, ['src/auth/**', 'src/payments/**']);
+  assert.deepEqual(p.pivotal, ['src/routes/reveal/**']);
+  assert.equal(p.agentSafe, true);
+  assert.equal(g.classify({ ...agentPr, policy: p, files: [f('src/payments/charge.ts')] }).risk, 'normal');
+});
+
+test('agent-safe: unreadable policy syntax turns the tier off (fail closed)', () => {
+  assert.equal(g.parseOpsPolicy('agent_safe: true\nsensitive_paths:\n  - a/**\n  b/**\n').agentSafe, false);
+  assert.equal(g.parseOpsPolicy('agent_safe: true\nsensitive_paths: a/**\n').agentSafe, false);
+  assert.equal(g.parseOpsPolicy('agent_safe: true\nsensitive_paths:\n  - a/**\nagent_max_lines: 200\n').maxLines, 200);
+});
+
+test('renames are judged on both the old and the new path (Codex P1)', () => {
+  const ren = (from, to) => f(to, '+x', { status: 'renamed', previous_filename: from });
+  const c = (files) => g.classify({ ...agentPr, files }).risk;
+  assert.equal(c([ren('src/auth/login.ts', 'src/login.ts')]), 'normal');
+  assert.equal(c([ren('src/login.ts', 'src/auth/login.ts')]), 'normal');
+  assert.equal(c([ren('src/routes/reveal/a.svelte', 'src/a.svelte')]), 'normal');
+  assert.equal(c([ren('.github/workflows/ci.yml', 'ci.yml')]), 'normal');
+  assert.equal(c([ren('src/a.ts', 'src/b.ts')]), 'agent');
+  // docs tier: code renamed into docs is not a docs change
+  assert.equal(g.classify({ ...base, files: [ren('src/x.ts', 'docs/x.md')] }).risk, 'normal');
+  assert.equal(g.classify({ ...base, files: [ren('docs/a.md', 'docs/b.md')] }).risk, 'low');
+});
