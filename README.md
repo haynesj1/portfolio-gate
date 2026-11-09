@@ -10,7 +10,7 @@ A merge gate for repositories where AI coding agents open pull requests. It sets
 
 ## Codex-written PRs need a second review
 
-Codex reviews every PR, so a PR on a `codex/` branch also needs a Claude `review-verdict:v1` for its head commit (`clear` to pass; `blocking` fails unless the owner adds `review:override`). The portfolio-ops dispatcher starts a Claude review session for each such PR. Those sessions post through the owner's account, so on `codex/` PRs only, an owner-account verdict counts as well as one from `claude[bot]`.
+Codex reviews every PR, so a PR on a `codex/` branch also needs a Claude `review-verdict:v1` for its head commit (`clear` to pass; `blocking` fails unless the owner adds `review:override`; if no Claude review arrives, the owner's `human-approved` on that commit stands in for it). The portfolio-ops dispatcher starts a Claude review session for each such PR. Those sessions post through the owner's account, so on `codex/` PRs only, an owner-account verdict counts as well as one from `claude[bot]`.
 
 Because agents act as the owner, a forged verdict is possible. It can only reduce a Codex PR to Codex-only review, which was the position before this rule. Codex's own clean review is still required, and owner-account verdicts never count on any other PR (portfolio-ops decision 0006).
 

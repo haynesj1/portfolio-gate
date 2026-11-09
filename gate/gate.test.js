@@ -260,3 +260,10 @@ test('review:override by the owner overrules a blocking Claude review of a Codex
   const over = { ...codexPr, labels: ['review:override'], feedback: [codex('H'), verdictBy(OWNER, 'H', 'blocking')], labelEvents: [{ event: 'labeled', label: 'review:override', actor: OWNER, viaApp: false, at: '2026-11-06T11:00:00Z' }] };
   assert.equal(g.decide(over).state, 'success');
 });
+
+test('the owner approving a Codex PR stands in for a missing Claude review, not for Codex', () => {
+  const approvedPr = { ...codexPr, labels: ['human-approved'], labelEvents: [label('2026-11-06T11:00:00Z')] };
+  assert.equal(g.decide(approvedPr).state, 'success');
+  assert.equal(g.decide({ ...approvedPr, feedback: [] }).state, 'pending');
+  assert.equal(g.decide({ ...approvedPr, feedback: [codex('H'), verdictBy(OWNER, 'H', 'blocking')] }).state, 'failure');
+});

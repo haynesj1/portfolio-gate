@@ -257,7 +257,8 @@ function decide(input) {
   else if (review === 'blocking') { state = 'failure'; description = 'Reviewer found P0/P1 issues on this commit (or review:blocking)'; }
   else if (review === 'missing') { state = 'pending'; description = 'Waiting for a completed review of this commit'; }
   else if (second === 'blocking' && !overridden2) { state = 'failure'; description = 'Claude review of this Codex PR found P0/P1 issues'; }
-  else if (second === 'missing') { state = 'pending'; description = 'Codex PR: waiting for the Claude review of this commit'; }
+  // Jordan's own approval of this commit stands in for a missing Claude review.
+  else if (second === 'missing' && !approved) { state = 'pending'; description = 'Codex PR: waiting for the Claude review of this commit'; }
   else if (risk === 'low') { state = 'success'; description = overridden ? 'risk:low; review findings overridden by owner' : 'risk:low and reviewed'; }
   else if (risk === 'agent') { state = 'success'; description = overridden ? 'risk:agent; review findings overridden by owner' : 'risk:agent (agent-safe) and reviewed'; }
   else if (approved) { state = 'success'; description = overridden ? 'human-approved; review findings overridden by owner' : 'human-approved and reviewed'; }
