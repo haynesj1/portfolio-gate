@@ -23,34 +23,39 @@ const labelled = (at, extra = {}) => ({ event: 'labeled', label: { name: 'human-
 const run = (sha, at, pr = 1, path = '.github/workflows/pr-gate.yml') => ({ head_sha: sha, created_at: at, path, pull_requests: [{ number: pr }] });
 const code = [{ filename: 'src/app.ts', status: 'modified', patch: '+x', additions: 1 }];
 
-function harness({ headSha = 'H', event = 'pull_request_target', action = 'synchronize', files = code, comments = [], timeline = [], runs = [], labels = [] }) {
-  const written = []; const added = [];
+function harness({ headSha = 'H', event = 'pull_request_target', action = 'synchronize', files = code, comments = [], timeline = [], runs = [], labels = [], headRef = 'feature', ops = null, issue = null, openPrs = [], issueEvent = null, pushRef = undefined }) {
+  const written = []; const added = []; const seenRefs = [];
   const github = {
     paginate: async (fn, args) => fn(args),
     rest: {
       pulls: {
-        get: async () => ({ data: { state: 'open', draft: false, title: 't', user: { login: OWNER }, labels: labels.map((name) => ({ name })), head: { sha: headSha } } }),
+        get: async () => ({ data: { state: 'open', draft: false, title: 't', body: '', user: { login: OWNER }, labels: labels.map((name) => ({ name })), head: { sha: headSha, ref: headRef }, base: { repo: { default_branch: 'main' } } } }),
         listFiles: async () => files,
+        list: async () => openPrs,
         listCommits: async () => [{ author: { login: OWNER } }],
         listReviews: async () => [],
         listReviewComments: async () => [],
       },
       issues: {
         listEventsForTimeline: async () => timeline,
+        get: async ({ issue_number: n }) => { if (!issue || issue.number !== n) throw Object.assign(new Error('nf'), { status: 404 }); return { data: issue }; },
         listComments: async () => comments,
         addLabels: async ({ labels: l }) => added.push(...l),
         removeLabel: async () => {},
       },
-      repos: { createCommitStatus: async (s) => written.push(s) },
+      repos: {
+        createCommitStatus: async (s) => written.push(s),
+        getContent: async ({ ref }) => { if (!ops) throw Object.assign(new Error('nf'), { status: 404 }); seenRefs.push(ref); return { data: { content: Buffer.from(ops).toString('base64') } }; },
+      },
       actions: { listWorkflowRunsForRepo: async ({ head_sha: sha, event: ev }) => runs.filter((r) => r.head_sha === sha && ev === 'pull_request_target') },
     },
   };
   const context = {
-    repo: { owner: OWNER, repo: 'r' }, eventName: event, serverUrl: 'https://github.com', runId: 42,
-    payload: { action, label: action === 'labeled' ? { name: 'human-approved' } : undefined, pull_request: { number: 1, updated_at: '2026-11-06T10:00:00Z' } },
+    ref: pushRef, repo: { owner: OWNER, repo: 'r' }, eventName: event, serverUrl: 'https://github.com', runId: 42,
+    payload: issueEvent || { action, label: action === 'labeled' ? { name: 'human-approved' } : undefined, pull_request: { number: 1, updated_at: '2026-11-06T10:00:00Z' } },
   };
   const core = { info() {}, warning() {}, summary: { addHeading() { return this; }, addList() { return this; }, write: async () => {} } };
-  return { run: () => script(github, context, core), written, added, gate: () => written.filter((s) => s.context === 'review-gate').at(-1) };
+  return { github, run: () => script(github, context, core), written, added, seenRefs, gate: () => written.filter((s) => s.context === 'review-gate').at(-1) };
 }
 
 test('workflow: owner approval after the head was first seen passes', async () => {
@@ -126,7 +131,11 @@ test('workflow: Codex findings on the head block; running review waits', async (
 test('caller only uses triggers that run default-branch code, and calls the gate (Codex P1 #2)', () => {
   const caller = fs.readFileSync(path.join(__dirname, '..', 'caller', 'pr-gate.yml'), 'utf8');
   const on = caller.slice(caller.indexOf('\non:'), caller.indexOf('\npermissions:'));
-  for (const bad of ['pull_request_review', 'workflow_dispatch', 'push:', '\n  pull_request:', 'workflow_run']) assert.ok(!on.includes(bad), bad);
+  for (const bad of ['pull_request_review', 'workflow_dispatch', '\n  pull_request:', 'workflow_run']) assert.ok(!on.includes(bad), bad);
+  // push is allowed only as default-branch pushes of .ops.yml (policy changes), which
+  // happen only by merging a reviewed PR; any other push trigger is rejected.
+  const pushBlock = on.includes('push:') ? on.slice(on.indexOf('\n  push:')).split('\n').filter((l) => /^ {4}\S/.test(l)) : [];
+  if (on.includes('push:')) assert.deepEqual(pushBlock, ["    branches: [main, master]", "    paths: ['.ops.yml']"]);
   assert.ok(on.includes('pull_request_target') && on.includes('issue_comment'));
   assert.match(caller, /uses: haynesj1\/portfolio-gate\/\.github\/workflows\/gate\.yml@main/);
   // Comment runs are filtered to review results, and concurrency sits on the job so a
@@ -176,4 +185,119 @@ test('caller comment filter: review results evaluate, other comments are skipped
   assert.equal(onComment('Fixed now.', true, 'Fixed in the latest push.'), false);
   // PR events always evaluate.
   for (const event_name of ['pull_request_target']) assert.equal(run({ event_name, event: {} }), true);
+  // Issue events evaluate only when they can change the agent-safe tier.
+  const onIssue = (action, label, pr = false) => run({ event_name: 'issues', event: { action, label: label ? { name: label } : undefined, issue: pr ? { pull_request: { url: 'x' } } : {} } });
+  assert.equal(onIssue('closed'), true);
+  assert.equal(onIssue('reopened'), true);
+  for (const l of ['ready', 'in-progress', 'pivotal']) { assert.equal(onIssue('labeled', l), true); assert.equal(onIssue('unlabeled', l), true); }
+  assert.equal(onIssue('labeled', 'size:S'), false);
+  assert.equal(onIssue('labeled', 'human-approved', true), false);
+});
+
+test('workflow: agent-safe PR passes without approval, reading .ops.yml from the default branch', async () => {
+  const h = harness({ headRef: 'claude/7', ops: 'agent_safe: true\n', issue: { number: 7, state: 'open', labels: [{ name: 'ready' }] }, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  await h.run();
+  assert.equal(h.gate().state, 'success');
+  assert.deepEqual(h.added, ['risk:agent']);
+  assert.ok(h.seenRefs.length >= 1 && h.seenRefs.every((r) => r === 'main'));
+});
+
+test('workflow: without .ops.yml opt-in the same PR still needs approval', async () => {
+  const h = harness({ headRef: 'claude/7', issue: { number: 7, state: 'open', labels: [{ name: 'ready' }] }, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  await h.run();
+  assert.equal(h.gate().state, 'pending');
+  assert.deepEqual(h.added, ['risk:normal']);
+});
+
+test('workflow: an issue event re-evaluates only the open PRs that implement it', async () => {
+  const pr = (number, ref, body = '') => ({ number, head: { ref }, body });
+  const h = harness({
+    event: 'issues', headRef: 'claude/7', ops: 'agent_safe: true\n',
+    issue: { number: 7, state: 'open', labels: [{ name: 'ready' }, { name: 'pivotal' }] },
+    issueEvent: { action: 'labeled', label: { name: 'pivotal' }, issue: { number: 7 } },
+    openPrs: [pr(1, 'claude/7'), pr(2, 'claude/8')],
+    comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')],
+  });
+  await h.run();
+  assert.equal(h.written.length, 1);
+  assert.equal(h.gate().state, 'pending');
+  assert.deepEqual(h.added, ['risk:normal']);
+});
+
+test('caller: PR body edits re-evaluate (the linked issue can live in the body)', () => {
+  const callerYml = fs.readFileSync(path.join(__dirname, '..', 'caller', 'pr-gate.yml'), 'utf8');
+  assert.match(callerYml, /pull_request_target:\n(\s+#.*\n)*\s+types: \[opened, edited,/);
+});
+
+test('workflow: a run that published an agent-safe pass re-checks the issue and withdraws it if it changed (Codex P2)', async () => {
+  // The issue gains `pivotal` between this run's first read and its write: the
+  // stale pass must be replaced by this same run.
+  let reads = 0;
+  const h = harness({ headRef: 'claude/7', ops: 'agent_safe: true\n', comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  const before = { number: 7, state: 'open', labels: [{ name: 'ready' }] };
+  const after = { number: 7, state: 'open', labels: [{ name: 'ready' }, { name: 'pivotal' }] };
+  h.github.rest.issues.get = async () => ({ data: reads++ === 0 ? before : after });
+  await h.run();
+  const states = h.written.filter((x) => x.context === 'review-gate').map((x) => x.state);
+  assert.deepEqual(states, ['success', 'pending']);
+  assert.equal(h.gate().state, 'pending');
+});
+
+test('workflow: an unchanged issue means one write only', async () => {
+  const h = harness({ headRef: 'claude/7', ops: 'agent_safe: true\n', issue: { number: 7, state: 'open', labels: [{ name: 'ready' }] }, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  await h.run();
+  assert.equal(h.written.filter((x) => x.context === 'review-gate').length, 1);
+});
+
+test('workflow: the post-write check also catches a PR body edit that drops the linked issue (Codex P2)', async () => {
+  // Branch without an issue number: the link comes from the body, which loses
+  // `Closes #7` between this run's first read and its write.
+  const h = harness({ headRef: 'claude/fix-login', ops: 'agent_safe: true\n', issue: { number: 7, state: 'open', labels: [{ name: 'ready' }] }, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  const base = (body) => ({ data: { state: 'open', draft: false, title: 't', body, user: { login: OWNER }, labels: [], head: { sha: 'H', ref: 'claude/fix-login' }, base: { repo: { default_branch: 'main' } } } });
+  let gets = 0;
+  h.github.rest.pulls.get = async () => (gets++ === 0 ? base('Closes #7') : base('no link any more'));
+  await h.run();
+  assert.deepEqual(h.written.filter((x) => x.context === 'review-gate').map((x) => x.state), ['success', 'pending']);
+});
+
+test('workflow: the post-write check stops if a newer commit has arrived', async () => {
+  const h = harness({ headRef: 'claude/7', ops: 'agent_safe: true\n', issue: { number: 7, state: 'open', labels: [{ name: 'ready' }] }, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  const get = h.github.rest.pulls.get; let gets = 0;
+  h.github.rest.pulls.get = async (a) => { const r = await get(a); return gets++ === 0 ? r : { data: { ...r.data, head: { ...r.data.head, sha: 'NEW' } } }; };
+  await h.run();
+  assert.equal(h.written.filter((x) => x.context === 'review-gate').length, 1);
+});
+
+test('workflow: after publishing a pass, a review:blocking label added meanwhile wins (Codex P2)', async () => {
+  const h = harness({ headRef: 'claude/7', ops: 'agent_safe: true\n', issue: { number: 7, state: 'open', labels: [{ name: 'ready' }] }, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  const get = h.github.rest.pulls.get; let gets = 0;
+  h.github.rest.pulls.get = async (a) => { const r = await get(a); return gets++ === 0 ? r : { data: { ...r.data, labels: [{ name: 'review:blocking' }] } }; };
+  await h.run();
+  assert.deepEqual(h.written.filter((x) => x.context === 'review-gate').map((x) => x.state), ['success', 'failure']);
+});
+
+test('workflow: a non-pass result is published once, with no re-check', async () => {
+  const h = harness({ comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  let gets = 0; const get = h.github.rest.pulls.get;
+  h.github.rest.pulls.get = async (a) => { gets++; return get(a); };
+  await h.run();
+  assert.equal(h.gate().state, 'pending');
+  assert.equal(gets, 1);
+});
+
+test('workflow: a .ops.yml push to the default branch re-evaluates open agent PRs only (Codex P2)', async () => {
+  const pr = (number, ref) => ({ number, head: { ref }, body: '' });
+  const h = harness({ event: 'push', pushRef: 'refs/heads/main', issueEvent: { repository: { default_branch: 'main' } }, headRef: 'claude/7',
+    ops: 'agent_safe: false\n', openPrs: [pr(1, 'claude/7'), pr(2, 'feature/x')], comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
+  await h.run();
+  assert.equal(h.written.length, 1);
+  assert.equal(h.gate().state, 'pending');
+  const other = harness({ event: 'push', pushRef: 'refs/heads/claude/7', issueEvent: { repository: { default_branch: 'main' } }, openPrs: [pr(1, 'claude/7')] });
+  await other.run();
+  assert.equal(other.written.length, 0);
+});
+
+test('caller: pushes of .ops.yml to the default branch trigger the gate', () => {
+  const callerYml = fs.readFileSync(path.join(__dirname, '..', 'caller', 'pr-gate.yml'), 'utf8');
+  assert.match(callerYml, /push:\n\s+branches: \[main, master\]\n\s+paths: \['\.ops\.yml'\]/);
 });

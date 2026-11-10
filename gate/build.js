@@ -7,5 +7,5 @@ const js = fs.readFileSync(path.join(__dirname, 'gate.js'), 'utf8')
 const tpl = fs.readFileSync(path.join(__dirname, 'gate.template.yml'), 'utf8');
 const out = path.join(__dirname, '..', '.github', 'workflows', 'gate.yml');
 fs.mkdirSync(path.dirname(out), { recursive: true });
-fs.writeFileSync(out, tpl.replace('__GATE_JS__', js));
+fs.writeFileSync(out, tpl.replace('__GATE_JS__', () => js));
 console.log(`wrote ${path.relative(process.cwd(), out)}`);

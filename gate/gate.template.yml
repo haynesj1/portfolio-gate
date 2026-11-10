@@ -2,7 +2,7 @@
 # Shared merge gate (reusable workflow). Each app repo calls it from a small
 # `pr-gate.yml` using only default-branch triggers, so a PR cannot change the
 # gate that judges it. Sets the required `review-gate` commit status and the
-# risk:low / risk:normal label. Design: decision records in portfolio-ops.
+# risk:low / risk:agent / risk:normal label. Design: decision records in portfolio-ops.
 name: gate
 
 on:
@@ -21,65 +21,128 @@ jobs:
 __GATE_JS__
               return module.exports; })();
             const { owner, repo } = context.repo;
-            const number = context.payload.pull_request?.number || context.payload.issue?.number;
-            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
-            if (pr.state !== 'open') return;
-            const headSha = pr.head.sha;
-            const list = (fn, args) => github.paginate(fn, { owner, repo, per_page: 100, ...args });
-            const files = await list(github.rest.pulls.listFiles, { pull_number: number });
-            const commits = await list(github.rest.pulls.listCommits, { pull_number: number });
-            const reviews = await list(github.rest.pulls.listReviews, { pull_number: number });
-            const comments = await list(github.rest.issues.listComments, { issue_number: number });
-            const reviewComments = await list(github.rest.pulls.listReviewComments, { pull_number: number });
-            let timeline = await list(github.rest.issues.listEventsForTimeline, { issue_number: number });
-            // The timeline can lag the label webhook by a few seconds.
-            const justLabelled = context.eventName === 'pull_request_target' && context.payload.action === 'labeled';
-            const sinceMs = Date.parse(context.payload.pull_request?.updated_at || 0) - 5000;
-            const seen = () => timeline.some((e) => e.event === 'labeled' && e.label?.name === context.payload.label?.name && Date.parse(e.created_at) >= sinceMs);
-            for (let i = 0; justLabelled && i < 4 && !seen(); i++) {
-              await new Promise((r) => setTimeout(r, 5000));
-              timeline = await list(github.rest.issues.listEventsForTimeline, { issue_number: number });
+            // Reads every input the gate decides on, fresh from GitHub.
+            async function gather(number) {
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+              if (pr.state !== 'open') return null;
+              const headSha = pr.head.sha;
+              const list = (fn, args) => github.paginate(fn, { owner, repo, per_page: 100, ...args });
+              const files = await list(github.rest.pulls.listFiles, { pull_number: number });
+              const commits = await list(github.rest.pulls.listCommits, { pull_number: number });
+              const reviews = await list(github.rest.pulls.listReviews, { pull_number: number });
+              const comments = await list(github.rest.issues.listComments, { issue_number: number });
+              const reviewComments = await list(github.rest.pulls.listReviewComments, { pull_number: number });
+              let timeline = await list(github.rest.issues.listEventsForTimeline, { issue_number: number });
+              // The timeline can lag the label webhook by a few seconds.
+              const justLabelled = context.eventName === 'pull_request_target' && context.payload.action === 'labeled';
+              const sinceMs = Date.parse(context.payload.pull_request?.updated_at || 0) - 5000;
+              const seen = () => timeline.some((e) => e.event === 'labeled' && e.label?.name === context.payload.label?.name && Date.parse(e.created_at) >= sinceMs);
+              for (let i = 0; justLabelled && i < 4 && !seen(); i++) {
+                await new Promise((r) => setTimeout(r, 5000));
+                timeline = await list(github.rest.issues.listEventsForTimeline, { issue_number: number });
+              }
+              const labelEvents = timeline.filter((e) => e.event === 'labeled' || e.event === 'unlabeled')
+                .map((e) => ({ event: e.event, label: e.label?.name, actor: e.actor?.login, viaApp: !!e.performed_via_github_app, at: e.created_at }));
+              const forcePushTimes = timeline.filter((e) => e.event === 'head_ref_force_pushed').map((e) => e.created_at);
+              // When this PR adopted its head: the earliest pr-gate run GitHub recorded
+              // for this PR and SHA (this run included, so there is always one).
+              const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo,
+                { owner, repo, event: 'pull_request_target', head_sha: headSha, per_page: 100 });
+              const adopted = runs.filter((r) => r.path?.endsWith('pr-gate.yml') && r.pull_requests?.some((p) => p.number === number))
+                .map((r) => r.created_at).sort();
+              // Agent-safe tier policy: .ops.yml from the DEFAULT branch, never the PR.
+              let policy = null;
+              try {
+                const { data } = await github.rest.repos.getContent({ owner, repo, path: '.ops.yml', ref: pr.base.repo.default_branch });
+                policy = gate.parseOpsPolicy(Buffer.from(data.content, 'base64').toString('utf8'));
+              } catch (e) { core.info(`no .ops.yml policy: ${e.status || e.message}`); }
+              const issueNumber = gate.linkedIssue(pr.head.ref, pr.body);
+              const readIssue = async (n) => {
+                if (!policy?.agentSafe || !n) return null;
+                try {
+                  const { data } = await github.rest.issues.get({ owner, repo, issue_number: n });
+                  return data.pull_request ? null : { number: n, state: data.state, labels: data.labels.map((l) => (typeof l === 'string' ? l : l.name)) };
+                } catch (e) { core.info(`linked issue #${n} not readable: ${e.status || e.message}`); return null; }
+              };
+              const issue = await readIssue(issueNumber);
+              const input = {
+                author: pr.user.login,
+                headRef: pr.head.ref,
+                policy,
+                issue,
+                title: pr.title,
+                draft: pr.draft,
+                owner: context.repo.owner,
+                labels: pr.labels.map((l) => l.name),
+                files: files.map((f) => ({ filename: f.filename, previous_filename: f.previous_filename, status: f.status, patch: f.patch || '', additions: f.additions, deletions: f.deletions })),
+                commitAuthors: commits.map((c) => c.author?.login || c.commit?.author?.name || ''),
+                labelEvents,
+                feedback: [
+                  ...reviews.map((r) => ({ author: r.user?.login || '', body: r.body, commitId: r.commit_id })),
+                  ...reviewComments.map((c) => ({ author: c.user?.login || '', body: c.body, commitId: c.commit_id })),
+                  ...comments.map((c) => ({ author: c.user?.login || '', body: c.body })),
+                ],
+                headSha,
+                headAdoptedAt: adopted[0],
+                forcePushTimes,
+              };
+              return input;
             }
-            const labelEvents = timeline.filter((e) => e.event === 'labeled' || e.event === 'unlabeled')
-              .map((e) => ({ event: e.event, label: e.label?.name, actor: e.actor?.login, viaApp: !!e.performed_via_github_app, at: e.created_at }));
-            const forcePushTimes = timeline.filter((e) => e.event === 'head_ref_force_pushed').map((e) => e.created_at);
-            // When this PR adopted its head: the earliest pr-gate run GitHub recorded
-            // for this PR and SHA (this run included, so there is always one).
-            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo,
-              { owner, repo, event: 'pull_request_target', head_sha: headSha, per_page: 100 });
-            const adopted = runs.filter((r) => r.path?.endsWith('pr-gate.yml') && r.pull_requests?.some((p) => p.number === number))
-              .map((r) => r.created_at).sort();
-            const input = {
-              author: pr.user.login,
-              title: pr.title,
-              draft: pr.draft,
-              owner: context.repo.owner,
-              labels: pr.labels.map((l) => l.name),
-              files: files.map((f) => ({ filename: f.filename, status: f.status, patch: f.patch || '', additions: f.additions })),
-              commitAuthors: commits.map((c) => c.author?.login || c.commit?.author?.name || ''),
-              labelEvents,
-              feedback: [
-                ...reviews.map((r) => ({ author: r.user?.login || '', body: r.body, commitId: r.commit_id })),
-                ...reviewComments.map((c) => ({ author: c.user?.login || '', body: c.body, commitId: c.commit_id })),
-                ...comments.map((c) => ({ author: c.user?.login || '', body: c.body })),
-              ],
-              headSha,
-              headAdoptedAt: adopted[0],
-              forcePushTimes,
-            };
-            const result = gate.decide(input);
-            core.info(JSON.stringify({ ...result, headAdoptedAt: input.headAdoptedAt }, null, 2));
-            const want = `risk:${result.risk}`;
-            const other = result.risk === 'low' ? 'risk:normal' : 'risk:low';
-            if (!input.labels.includes(want)) await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: [want] });
-            if (input.labels.includes(other)) await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name: other }).catch(() => {});
-            await github.rest.repos.createCommitStatus({
-              owner, repo, sha: headSha, context: 'review-gate',
-              state: result.state, description: result.description.slice(0, 140),
-              // Provenance: the daily audit checks each merged PR's final status
-              // links to a pr-gate run (decision 0003).
-              target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
-            });
-            await core.summary.addHeading(`review-gate: ${result.state}`).addList([
-              `risk: ${result.risk} (${result.reasons.join('; ')})`, `review: ${result.review}`, `human-approved: ${result.approved}`,
-            ]).write();
+            async function evaluate(number) {
+              let input = await gather(number);
+              if (!input) return;
+              const headSha = input.headSha;
+              const publish = async (result, labels) => {
+                core.info(JSON.stringify({ ...result, headAdoptedAt: input.headAdoptedAt }, null, 2));
+                const want = `risk:${result.risk}`;
+                if (!labels.includes(want)) await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: [want] });
+                for (const other of ['risk:low', 'risk:agent', 'risk:normal'].filter((l) => l !== want && labels.includes(l))) {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name: other }).catch(() => {});
+                }
+                await github.rest.repos.createCommitStatus({
+                  owner, repo, sha: headSha, context: 'review-gate',
+                  state: result.state, description: result.description.slice(0, 140),
+                  // Provenance: the daily audit checks each merged PR's final status
+                  // links to a pr-gate run (decision 0003).
+                  target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+                });
+              };
+              let result = gate.decide(input);
+              await publish(result, input.labels);
+              // Write, then verify. Runs for the same PR can overlap (PR, comment and
+              // issue events use different concurrency groups), so an older run could
+              // publish a pass after a newer one published a block or a revocation.
+              // After publishing a pass, re-gather EVERY input from GitHub and decide
+              // again; if the answer changed, publish that instead. Whichever run
+              // writes last has therefore read all inputs after the last change.
+              for (let i = 0; i < 3 && result.state === 'success'; i++) {
+                const fresh = await gather(number);
+                if (!fresh || fresh.headSha !== headSha) break; // closed, or a new commit with its own evaluation
+                const again = gate.decide(fresh);
+                if (again.state === result.state && again.risk === result.risk) break;
+                input = fresh;
+                result = again;
+                await publish(result, fresh.labels);
+              }
+              await core.summary.addHeading(`review-gate: ${result.state}`).addList([
+                `risk: ${result.risk} (${result.reasons.join('; ')})`, `review: ${result.review}`, `human-approved: ${result.approved}`,
+              ]).write();
+            }
+            if (context.eventName === 'push') {
+              // The agent-safe policy (.ops.yml) changed. Only a push to the default
+              // branch counts; re-evaluate every open agent PR under the new policy.
+              if (context.ref !== `refs/heads/${context.payload.repository?.default_branch}`) return;
+              const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
+              for (const p of open.filter((x) => /^(claude|codex)\//.test(x.head.ref))) await evaluate(p.number);
+              return;
+            }
+            if (context.eventName === 'issues') {
+              // An issue changed (closed, reopened, ready / in-progress / pivotal
+              // label): re-evaluate the open PRs that implement it, because the
+              // agent-safe tier depends on the linked issue's state.
+              const n = context.payload.issue.number;
+              const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
+              for (const p of open.filter((x) => gate.linkedIssue(x.head.ref, x.body) === n)) await evaluate(p.number);
+              return;
+            }
+            await evaluate(context.payload.pull_request?.number || context.payload.issue?.number);

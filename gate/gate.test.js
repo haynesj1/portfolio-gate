@@ -129,3 +129,231 @@ test('decide: end-to-end outcomes', () => {
   assert.equal(g.decide({ ...dep, feedback: [] }).state, 'pending');
   assert.equal(g.decide(dep).state, 'success');
 });
+
+// ---- agent-safe tier (portfolio-ops decision 0005) -----------------------
+const OPS = `app: x
+agent_safe: true   # on for this repo
+agent_max_lines: 300
+sensitive_paths:
+  - "src/auth/**"
+  - db/migrations/
+pivotal_paths: ["src/routes/reveal/**"]
+`;
+const policy = g.parseOpsPolicy(OPS);
+const queued = { number: 7, state: 'open', labels: ['ready', 'agent:claude'] };
+const agentPr = { ...base, headRef: 'claude/7', policy, issue: queued, files: [f('src/app.ts', '+x', { additions: 20, deletions: 5 })] };
+
+test('agent-safe: .ops.yml policy is parsed, off by default', () => {
+  assert.deepEqual(policy, { agentSafe: true, maxLines: 300, sensitive: ['src/auth/**', 'db/migrations/'], pivotal: ['src/routes/reveal/**'] });
+  assert.equal(g.parseOpsPolicy('app: x\n').agentSafe, false);
+  assert.equal(g.parseOpsPolicy('').maxLines, 400);
+});
+
+test('agent-safe: globs match paths and directories', () => {
+  assert.ok(g.globToRegExp('src/auth/**').test('src/auth/a/b.ts'));
+  assert.ok(g.globToRegExp('db/migrations/').test('db/migrations/001.sql'));
+  assert.ok(g.globToRegExp('*.sql').test('a.sql'));
+  assert.ok(!g.globToRegExp('*.sql').test('dir/a.sql'));
+  assert.ok(!g.globToRegExp('src/auth/**').test('src/authz.ts'));
+});
+
+test('agent-safe: linked issue from branch or Closes line', () => {
+  assert.equal(g.linkedIssue('claude/12', ''), 12);
+  assert.equal(g.linkedIssue('codex/fix-map', 'Closes #34\n...'), 34);
+  assert.equal(g.linkedIssue('feature/x', 'nothing'), null);
+});
+
+test('agent-safe: a small agent PR for a queued issue is risk:agent and passes once reviewed', () => {
+  assert.equal(g.classify(agentPr).risk, 'agent');
+  const d = g.decide(agentPr);
+  assert.equal(d.state, 'success');
+  assert.match(d.description, /agent-safe/);
+  assert.equal(g.decide({ ...agentPr, feedback: [] }).state, 'pending');
+  assert.equal(g.decide({ ...agentPr, feedback: [codex('H', true)] }).state, 'failure');
+});
+
+test('agent-safe: each condition falls back to risk:normal', () => {
+  const normal = (over) => g.classify({ ...agentPr, ...over }).risk;
+  assert.equal(normal({ policy: g.parseOpsPolicy('app: x') }), 'normal');
+  assert.equal(normal({ policy: null }), 'normal');
+  assert.equal(normal({ headRef: 'feature/7' }), 'normal');
+  assert.equal(normal({ issue: null }), 'normal');
+  assert.equal(normal({ issue: { ...queued, state: 'closed' } }), 'normal');
+  assert.equal(normal({ issue: { ...queued, labels: ['agent:claude'] } }), 'normal');
+  assert.equal(normal({ issue: { ...queued, labels: ['ready', 'pivotal'] } }), 'normal');
+  assert.equal(normal({ files: [f('src/auth/login.ts')] }), 'normal');
+  assert.equal(normal({ files: [f('src/routes/reveal/+page.svelte')] }), 'normal');
+  assert.equal(normal({ files: [f('package.json')] }), 'normal');
+  assert.equal(normal({ files: [f('src/old.ts', '', { status: 'removed' })] }), 'normal');
+  assert.equal(normal({ files: [f('src/a.test.ts', "-it('works', () => {})")] }), 'normal');
+  assert.equal(normal({ files: [f('src/a.ts', '+x', { additions: 250, deletions: 51 })] }), 'normal');
+  assert.equal(normal({ files: [f('.github/workflows/ci.yml')] }), 'normal');
+  assert.equal(normal({ files: [f('AGENTS.md')] }), 'normal');
+});
+
+test('agent-safe: in-progress issue still counts as queued; tests added alongside code are fine', () => {
+  assert.equal(g.classify({ ...agentPr, issue: { ...queued, labels: ['in-progress'] } }).risk, 'agent');
+  assert.equal(g.classify({ ...agentPr, files: [f('src/a.ts'), f('src/a.test.ts', "+it('x', () => {})")] }).risk, 'agent');
+});
+
+test('agent-safe: comments and blank lines inside a path list keep the list going (Codex P1)', () => {
+  const p = g.parseOpsPolicy(`agent_safe: true
+sensitive_paths:
+  - "src/auth/**"
+
+  # payments too
+  - src/payments/**   # trailing comment
+pivotal_paths:
+  - src/routes/reveal/**
+`);
+  assert.deepEqual(p.sensitive, ['src/auth/**', 'src/payments/**']);
+  assert.deepEqual(p.pivotal, ['src/routes/reveal/**']);
+  assert.equal(p.agentSafe, true);
+  assert.equal(g.classify({ ...agentPr, policy: p, files: [f('src/payments/charge.ts')] }).risk, 'normal');
+});
+
+test('agent-safe: unreadable policy syntax turns the tier off (fail closed)', () => {
+  assert.equal(g.parseOpsPolicy('agent_safe: true\nsensitive_paths:\n  - a/**\n  b/**\n').agentSafe, false);
+  assert.equal(g.parseOpsPolicy('agent_safe: true\nsensitive_paths: a/**\n').agentSafe, false);
+  assert.equal(g.parseOpsPolicy('agent_safe: true\nsensitive_paths:\n  - a/**\nagent_max_lines: 200\n').maxLines, 200);
+});
+
+test('renames are judged on both the old and the new path (Codex P1)', () => {
+  const ren = (from, to) => f(to, '+x', { status: 'renamed', previous_filename: from });
+  const c = (files) => g.classify({ ...agentPr, files }).risk;
+  assert.equal(c([ren('src/auth/login.ts', 'src/login.ts')]), 'normal');
+  assert.equal(c([ren('src/login.ts', 'src/auth/login.ts')]), 'normal');
+  assert.equal(c([ren('src/routes/reveal/a.svelte', 'src/a.svelte')]), 'normal');
+  assert.equal(c([ren('.github/workflows/ci.yml', 'ci.yml')]), 'normal');
+  assert.equal(c([ren('src/a.ts', 'src/b.ts')]), 'agent');
+  // docs tier: code renamed into docs is not a docs change
+  assert.equal(g.classify({ ...base, files: [ren('src/x.ts', 'docs/x.md')] }).risk, 'normal');
+  assert.equal(g.classify({ ...base, files: [ren('docs/a.md', 'docs/b.md')] }).risk, 'low');
+});
+
+// ---- second review for Codex PRs (portfolio-ops decision 0006) ------------
+const verdictBy = (author, sha, result) => ({ author, body: `<!-- review-verdict:v1 {"commit_sha":"${sha}","result":"${result}"} -->` });
+const codexPr = { ...agentPr, headRef: 'codex/7' };
+
+test('codex PRs need a Claude review-verdict for the head commit as well as Codex', () => {
+  assert.equal(g.decide(codexPr).state, 'pending');
+  assert.match(g.decide(codexPr).description, /waiting for the Claude review/);
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), verdictBy(OWNER, 'H', 'clear')] }).state, 'success');
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), verdictBy('claude[bot]', 'H', 'clear')] }).state, 'success');
+  // verdict for an older commit doesn't count; a blocking one fails
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), verdictBy(OWNER, 'OLD', 'clear')] }).state, 'pending');
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), verdictBy(OWNER, 'H', 'blocking')] }).state, 'failure');
+  // Codex's own review is still required
+  assert.equal(g.decide({ ...codexPr, feedback: [verdictBy(OWNER, 'H', 'clear')] }).state, 'pending');
+  // someone else's verdict doesn't count
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), verdictBy('someone', 'H', 'clear')] }).state, 'pending');
+});
+
+test('owner-account verdicts count only on codex/ PRs; Claude PRs are unchanged', () => {
+  assert.equal(g.secondReview({ headRef: 'claude/7', feedback: [], headSha: 'H', owner: OWNER }), 'not-needed');
+  assert.equal(g.decide(agentPr).state, 'success');
+  // an owner "clear" can't stand in for Codex's review on a Claude PR
+  assert.equal(g.decide({ ...agentPr, feedback: [verdictBy(OWNER, 'H', 'clear')] }).state, 'pending');
+});
+
+test('review:override by the owner overrules a blocking Claude review of a Codex PR', () => {
+  const over = { ...codexPr, labels: ['review:override'], feedback: [codex('H'), verdictBy(OWNER, 'H', 'blocking')], labelEvents: [{ event: 'labeled', label: 'review:override', actor: OWNER, viaApp: false, at: '2026-11-06T11:00:00Z' }] };
+  assert.equal(g.decide(over).state, 'success');
+});
+
+test('the owner approving a Codex PR stands in for a missing Claude review, not for Codex', () => {
+  const approvedPr = { ...codexPr, labels: ['human-approved'], labelEvents: [label('2026-11-06T11:00:00Z')] };
+  assert.equal(g.decide(approvedPr).state, 'success');
+  assert.equal(g.decide({ ...approvedPr, feedback: [] }).state, 'pending');
+  assert.equal(g.decide({ ...approvedPr, feedback: [codex('H'), verdictBy(OWNER, 'H', 'blocking')] }).state, 'failure');
+});
+
+// ---- second-round Codex findings --------------------------------------------
+test('renaming a test out of test discovery is not agent-safe (Codex P2)', () => {
+  const ren = (from, to, patch = '+x') => f(to, patch, { status: 'renamed', previous_filename: from });
+  const c = (files) => g.classify({ ...agentPr, files }).risk;
+  assert.equal(c([ren('tests/auth.test.ts', 'src/helper.ts')]), 'normal');
+  assert.equal(c([ren('src/a.test.ts', 'src/b.test.ts', "-it('x', () => {})")]), 'normal');
+  assert.equal(c([ren('src/a.test.ts', 'src/b.test.ts')]), 'low'); // a plain test rename is already low risk
+});
+
+test('indentless YAML list items are read; stray lines turn the tier off (Codex P1)', () => {
+  const p = g.parseOpsPolicy('agent_safe: true\nsensitive_paths:\n- src/auth/**\n- "db/"\npivotal_paths:\n- src/reveal/**\n');
+  assert.deepEqual(p.sensitive, ['src/auth/**', 'db/']);
+  assert.deepEqual(p.pivotal, ['src/reveal/**']);
+  assert.equal(g.classify({ ...agentPr, policy: p, files: [f('src/auth/login.ts')] }).risk, 'normal');
+  assert.equal(g.parseOpsPolicy('agent_safe: true\nsensitive_paths:\n- a/**\nnot a key\n').agentSafe, false);
+});
+
+test('on a Codex PR a Claude verdict alone never stands in for Codex review (Codex P2)', () => {
+  const only = { ...codexPr, feedback: [verdictBy('claude[bot]', 'H', 'clear')] };
+  assert.equal(g.reviewState(only), 'missing');
+  assert.equal(g.decide(only).state, 'pending');
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), verdictBy('claude[bot]', 'H', 'clear')] }).state, 'success');
+  // Claude PRs: a claude[bot] verdict still counts as a review, as before
+  assert.equal(g.reviewState({ ...agentPr, feedback: [verdictBy('claude[bot]', 'H', 'clear')] }), 'clear');
+});
+
+// ---- third-round Codex findings ---------------------------------------------
+test('policy parser is an allowlist: quoted keys or other odd lines turn the tier off (Codex P2)', () => {
+  assert.equal(g.parseOpsPolicy('agent_safe: true\n"sensitive_paths":\n  - src/auth/**\n').agentSafe, false);
+  assert.equal(g.parseOpsPolicy('agent_safe: true\n  sensitive_paths:\n  - src/auth/**\n').agentSafe, false);
+  assert.equal(g.parseOpsPolicy('agent_safe: true\nagent_max_lines: lots\n').agentSafe, false);
+  // the real .ops.yml files (flow maps, inline comments) still parse
+  const real = `# header
+app: london-living-app
+web: true
+install: cd app && npm ci
+data: { fetch: scripts/fetch_app_data.sh, into: data/processed/discovery }
+coverage: ./gradlew testDebugUnitTest  # Kover/JaCoCo to be added
+dead_code: { tool: knip, paths: [app], ignore: ["app/src/routes/**"] }
+agent_safe: true
+sensitive_paths:
+  - "src/auth/**"
+pivotal_paths: [src/routes/reveal/**]
+`;
+  const p = g.parseOpsPolicy(real);
+  assert.equal(p.agentSafe, true);
+  assert.deepEqual([p.sensitive, p.pivotal], [['src/auth/**'], ['src/routes/reveal/**']]);
+});
+
+test('on a Codex PR, overriding a blocking Claude verdict never stands in for Codex review (Codex P2)', () => {
+  const overrideEvents = [{ event: 'labeled', label: 'review:override', actor: OWNER, viaApp: false, at: '2026-11-06T11:00:00Z' }];
+  const noCodex = { ...codexPr, labels: ['review:override'], labelEvents: overrideEvents, feedback: [verdictBy('claude[bot]', 'H', 'blocking')] };
+  assert.equal(g.reviewState(noCodex), 'missing');
+  assert.equal(g.decide(noCodex).state, 'pending');
+  // with Codex clear, the same override does overrule the Claude block
+  assert.equal(g.decide({ ...noCodex, feedback: [codex('H'), verdictBy('claude[bot]', 'H', 'blocking')] }).state, 'success');
+  // without the override, a blocking Claude verdict fails a Codex-cleared PR
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), verdictBy('claude[bot]', 'H', 'blocking')] }).state, 'failure');
+});
+
+test('on a Codex PR, a claude[bot] P0/P1 line finding blocks through the second review', () => {
+  const line = { author: 'claude[bot]', commitId: 'H', body: '![P1 Badge](https://img.shields.io/badge/P1-orange) problem' };
+  assert.equal(g.secondReview({ headRef: 'codex/7', feedback: [line, verdictBy('claude[bot]', 'H', 'clear')], headSha: 'H', owner: OWNER }), 'blocking');
+  assert.equal(g.decide({ ...codexPr, feedback: [codex('H'), line, verdictBy(OWNER, 'H', 'clear')] }).state, 'failure');
+});
+
+test('lockfiles and package-manager config are never agent-safe (Codex P2)', () => {
+  for (const name of ['npm-shrinkwrap.json', 'app/npm-shrinkwrap.json', 'bun.lockb', 'poetry.lock', 'go.sum', 'Cargo.lock', '.npmrc', '.yarnrc.yml', 'pnpm-workspace.yaml', '.nvmrc', 'gradle/wrapper/gradle-wrapper.properties', 'settings.gradle.kts']) {
+    assert.equal(g.classify({ ...agentPr, files: [f(name, '+x', { additions: 50 })] }).risk, 'normal', name);
+  }
+  // the Dependabot path still only accepts real manifests
+  assert.equal(g.classify({ author: 'dependabot[bot]', title: 'Bump x from 1.2.3 to 1.2.4', labels: [], commitAuthors: ['dependabot[bot]'], files: [f('.npmrc')] }).risk, 'normal');
+  assert.equal(g.classify({ author: 'dependabot[bot]', title: 'Bump x from 1.2.3 to 1.2.4', labels: [], commitAuthors: ['dependabot[bot]'], files: [f('npm-shrinkwrap.json')] }).risk, 'low');
+});
+
+test('test removals are caught in any language and any file (Codex P2)', () => {
+  const c = (filename, patch) => g.classify({ ...agentPr, files: [f(filename, patch, { additions: 0, deletions: 5 })] }).risk;
+  assert.equal(c('internal/auth/login_test.go', '-func TestRejectInvalidToken(t *testing.T) {'), 'normal');
+  assert.equal(c('internal/auth/login.go', '-\tif err != nil { t.Fatal(err) }'), 'normal');
+  assert.equal(c('src/lib.rs', '-#[test]'), 'normal');
+  assert.equal(c('spec/user_spec.rb', "-  it 'works' do"), 'normal');
+  assert.equal(c('app/src/main/FooTest.kt', '-    @Test fun works() {}'), 'normal');
+  assert.equal(c('src/thing.go', '+\tt.Skip("later")'), 'normal');
+  assert.equal(c('src/a.py', '+@pytest.mark.xfail'), 'normal');
+  // ordinary code edits still qualify
+  assert.equal(c('src/app.ts', '-const x = 1;\n+const x = 2;'), 'agent');
+  // Go test files are recognised as tests (added tests alone are low risk)
+  assert.equal(g.classify({ ...base, files: [f('pkg/a_test.go', '+func TestNew(t *testing.T) {}')] }).risk, 'low');
+});

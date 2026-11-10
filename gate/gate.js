@@ -13,19 +13,30 @@ const PROTECTED = [
   /^specs\//, /^docs\/vision\.md$/, /^docs\/decisions\//,
 ];
 const TEST_PATH = [
-  /(^|\/)(tests?|__tests__|e2e|spec)\//, /\.(test|spec)\.[cm]?[jt]sx?$/,
-  /(^|\/)test_[^/]*\.py$/, /_test\.py$/, /(^|\/)src\/(test|androidTest)\//,
+  /(^|\/)(tests?|__tests__|e2e|spec|specs|testdata)\//, /\.(test|spec)\.[cm]?[jt]sx?$/,
+  /(^|\/)test_[^/]*\.py$/, /_test\.(py|go|rs|exs?)$/, /_spec\.rb$/, /(^|\/)src\/(test|androidTest)\//,
+  /(Test|Tests|Spec)\.(kt|kts|java|swift|scala|cs)$/,
 ];
 const DOC_PATH = [/\.md$/, /^docs\//];
 const DEPENDENCY_FILES = [
-  /(^|\/)package(-lock)?\.json$/, /(^|\/)pnpm-lock\.yaml$/, /(^|\/)yarn\.lock$/,
-  /(^|\/)uv\.lock$/, /(^|\/)pyproject\.toml$/, /(^|\/)requirements[^/]*\.txt$/,
-  /(^|\/)gradle\/libs\.versions\.toml$/, /(^|\/)build\.gradle(\.kts)?$/,
+  /(^|\/)package(-lock)?\.json$/, /(^|\/)npm-shrinkwrap\.json$/, /(^|\/)pnpm-lock\.yaml$/, /(^|\/)yarn\.lock$/,
+  /(^|\/)bun\.lockb?$/, /(^|\/)uv\.lock$/, /(^|\/)poetry\.lock$/, /(^|\/)Pipfile(\.lock)?$/,
+  /(^|\/)pyproject\.toml$/, /(^|\/)requirements[^/]*\.(txt|in)$/, /(^|\/)setup\.(py|cfg)$/,
+  /(^|\/)gradle\/libs\.versions\.toml$/, /(^|\/)(build|settings)\.gradle(\.kts)?$/, /(^|\/)gradle\.lockfile$/,
+  /(^|\/)Gemfile(\.lock)?$/, /(^|\/)go\.(mod|sum)$/, /(^|\/)Cargo\.(toml|lock)$/,
+];
+// Package-manager configuration (registries, install scripts, workspaces, tool
+// versions). Not a Dependabot manifest, but never agent-safe either.
+const PACKAGE_CONFIG_FILES = [
+  /(^|\/)\.npmrc$/, /(^|\/)\.yarnrc(\.yml)?$/, /(^|\/)\.pnpmfile\.cjs$/, /(^|\/)pnpm-workspace\.yaml$/,
+  /(^|\/)\.nvmrc$/, /(^|\/)\.node-version$/, /(^|\/)\.python-version$/, /(^|\/)\.tool-versions$/,
+  /(^|\/)pip\.conf$/, /(^|\/)gradle\.properties$/, /(^|\/)gradle\/wrapper\//,
 ];
 // A removed line in a test file that looks like a test or an assertion.
-const REMOVED_TEST_LINE = /^-(?!--).*(\b(it|test|describe)\s*\(|def test_|@Test\b|\bexpect\s*\(|\bassert)/m;
+// Covers JS/TS, Python, Kotlin/Java, Go, Rust, Ruby, Swift and Elixir test syntax.
+const REMOVED_TEST_LINE = /^-(?!--).*(\b(it|test|describe|context)\s*[('"]|def test_|@Test\b|\bexpect\s*[({]|\bassert|\bfunc Test\w*\(|#\[(tokio::)?test\]|\bt\.(Error|Errorf|Fatal|Fatalf|Run)\(|\bXCTAssert|\brequire\.\w+\()/m;
 // An added line that disables or narrows tests.
-const ADDED_SKIP_LINE = /^\+(?!\+\+).*(\.(skip|only|todo)\s*\(|\bx(it|describe)\s*\(|@pytest\.mark\.skip|@Ignore\b|@Disabled\b)/m;
+const ADDED_SKIP_LINE = /^\+(?!\+\+).*(\.(skip|only|todo|fixme)\s*\(|\bx(it|describe|test)\s*\(|@pytest\.mark\.(skip|xfail)|pytest\.skip\(|@unittest\.skip|@Ignore\b|@Disabled\b|\bt\.Skip(Now|f)?\(|#\[ignore\]|@tag :skip|\bpending\b\s*(\(|$))/m;
 const BLOCKING_FINDING = /(badge\/P[01]-|\bP[01]\s*Badge)/i;
 // Bot logins whose structured verdicts the gate accepts.
 const CODEX_BOT = 'chatgpt-codex-connector[bot]';
@@ -36,6 +47,7 @@ const isProtected = (f) => PROTECTED.some((r) => r.test(f));
 const isTest = (f) => TEST_PATH.some((r) => r.test(f));
 const isDoc = (f) => DOC_PATH.some((r) => r.test(f));
 const isDependencyFile = (f) => DEPENDENCY_FILES.some((r) => r.test(f));
+const isPackageConfig = (f) => PACKAGE_CONFIG_FILES.some((r) => r.test(f));
 
 function classifyFile(file) {
   const { filename, status, patch = '' } = file;
@@ -50,6 +62,101 @@ function classifyFile(file) {
   return { low: false, why: `code change ${filename}` };
 }
 
+// Agent-safe tier (portfolio-ops decision 0005). Opt-in per repo through
+// `.ops.yml` on the default branch (a protected path, so agents can't change
+// it in a PR). A PR qualifies only if it is an agent PR for a linked, queued,
+// non-pivotal issue, touches no protected, dependency, sensitive or pivotal
+// path, doesn't delete or skip tests, and stays under the size cap.
+// Only the keys below are read, so a tiny parser is enough (no YAML library).
+function parseOpsPolicy(text) {
+  // Allowlist parser: every line must be blank, a comment, a plain top-level
+  // `key: value`, or an item of the policy list being read. Anything else
+  // (quoted or indented keys, nested blocks, stray text) switches the tier off,
+  // so syntax this parser doesn't understand can never drop a restriction.
+  const policy = { agentSafe: false, maxLines: 400, sensitive: [], pivotal: [] };
+  const off = (why) => ({ ...policy, agentSafe: false, invalid: why });
+  let list = null;
+  for (const raw of String(text || '').split('\n')) {
+    if (/^\s*(#.*)?$/.test(raw)) continue;
+    const line = raw.replace(/\s+#.*$/, '');
+    const item = /^\s*-\s*["']?([^"']+?)["']?\s*$/.exec(line);
+    if (list && item) { policy[list].push(item[1]); continue; }
+    const kv = /^([a-z_]+):(?:\s+(.*))?$/.exec(line);
+    if (!kv) return off(`unreadable line: ${line.trim()}`);
+    list = null;
+    const key = kv[1]; const value = (kv[2] || '').trim();
+    if (key === 'agent_safe') policy.agentSafe = value === 'true';
+    else if (key === 'agent_max_lines') { if (!/^\d+$/.test(value)) return off('agent_max_lines is not a number'); policy.maxLines = Number(value); }
+    else if (key === 'sensitive_paths' || key === 'pivotal_paths') {
+      const name = key === 'sensitive_paths' ? 'sensitive' : 'pivotal';
+      const inline = /^\[(.*)\]$/.exec(value);
+      if (inline) policy[name].push(...inline[1].split(',').map((x) => x.trim().replace(/^["']|["']$/g, '')).filter(Boolean));
+      else if (!value) list = name;
+      else return off(`unreadable value for ${key}`);
+    }
+  }
+  return policy;
+}
+
+// Glob: `**` any path (including none), `*` within one path segment.
+function globToRegExp(glob) {
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*' && glob[i + 1] === '*') { re += glob[i + 2] === '/' ? '(?:.*/)?' : '.*'; i += glob[i + 2] === '/' ? 2 : 1; }
+    else if (c === '*') re += '[^/]*';
+    else re += /[.+?^${}()|[\]\\]/.test(c) ? `\\${c}` : c;
+  }
+  // Built by concatenation: gate/build.js inlines this file with String.replace,
+  // where a dollar sign before a backtick or ampersand is a special pattern.
+  const tail = glob.endsWith('/') ? '.*' : '(?:/.*)?';
+  return new RegExp('^' + re + tail + '\u0024');
+}
+const matchesAny = (file, globs) => globs.some((g) => globToRegExp(g).test(file));
+const pathsOf = (f) => (f.previous_filename && f.previous_filename !== f.filename ? [f.filename, f.previous_filename] : [f.filename]);
+
+// The issue an agent PR implements: from a `claude/<n>` or `codex/<n>` branch,
+// else the first `Closes #n` in the body.
+function linkedIssue(headRef, body) {
+  const b = /^(?:claude|codex)\/(\d+)$/.exec(headRef || '');
+  if (b) return Number(b[1]);
+  const c = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)\b/i.exec(body || '');
+  return c ? Number(c[1]) : null;
+}
+
+// Returns { ok, why }. `issue` is { state, labels } of the linked issue or null.
+function agentSafe({ headRef, files, policy, issue }) {
+  if (!policy?.agentSafe) return { ok: false, why: 'agent-safe tier not enabled for this repo' };
+  if (!/^(claude|codex)\//.test(headRef || '')) return { ok: false, why: 'not an agent branch' };
+  if (!issue) return { ok: false, why: 'no linked issue' };
+  if (issue.state !== 'open') return { ok: false, why: 'linked issue is not open' };
+  if (!issue.labels.includes('ready') && !issue.labels.includes('in-progress')) return { ok: false, why: 'linked issue was not queued (ready)' };
+  if (issue.labels.includes('pivotal')) return { ok: false, why: 'linked issue is pivotal' };
+  for (const f of files) {
+    // A rename touches two paths: both must be allowed.
+    for (const name of pathsOf(f)) {
+      if (isDependencyFile(name) || isPackageConfig(name)) return { ok: false, why: `dependency or package-manager file ${name}` };
+      if (matchesAny(name, policy.sensitive)) return { ok: false, why: `sensitive path ${name}` };
+      if (matchesAny(name, policy.pivotal)) return { ok: false, why: `pivotal path ${name}` };
+    }
+    // A test moved out of test discovery is a removed test, and the
+    // removal/skip checks apply when either side of a rename is a test.
+    if (f.previous_filename && isTest(f.previous_filename) && !isTest(f.filename)) return { ok: false, why: `test file moved out of tests: ${f.previous_filename}` };
+    // Language-agnostic backstop: whatever the file type, a removed test or
+    // assertion line, or an added skip, is never agent-safe (inline tests such as
+    // Rust #[test] or a test file this list doesn't recognise are still caught).
+    if (REMOVED_TEST_LINE.test(f.patch || '')) return { ok: false, why: `test or assertion line removed in ${f.filename}` };
+    if (ADDED_SKIP_LINE.test(f.patch || '')) return { ok: false, why: `test skipped or narrowed in ${f.filename}` };
+    if (pathsOf(f).some(isTest)) {
+      const c = classifyFile({ ...f, filename: pathsOf(f).find(isTest) });
+      if (!c.low) return { ok: false, why: c.why };
+    } else if (f.status === 'removed') return { ok: false, why: `file deleted: ${f.filename}` };
+  }
+  const lines = files.reduce((n, f) => n + (f.additions || 0) + (f.deletions || 0), 0);
+  if (lines > policy.maxLines) return { ok: false, why: `${lines} lines changed (cap ${policy.maxLines})` };
+  return { ok: true, why: `agent-safe: queued issue #${issue.number ?? '?'}, ${lines} lines, no sensitive paths` };
+}
+
 function isPatchBump(title) {
   const m = /from v?(\d+)\.(\d+)\.(\d+)\S* to v?(\d+)\.(\d+)\.(\d+)/.exec(title || '');
   return !!m && m[1] === m[4] && m[2] === m[5];
@@ -57,10 +164,9 @@ function isPatchBump(title) {
 
 // commits: authors of every commit on the PR (logins), used so that code
 // pushed onto a Dependabot branch by anyone else loses the Dependabot path.
-function classify({ author, title, labels, files, commitAuthors = [] }) {
-  if (files.some((f) => isProtected(f.filename))) {
-    return { risk: 'normal', reasons: files.filter((f) => isProtected(f.filename)).map((f) => `protected path ${f.filename}`) };
-  }
+function classify({ author, title, labels, files, commitAuthors = [], headRef, policy, issue }) {
+  const protectedPaths = files.flatMap(pathsOf).filter(isProtected);
+  if (protectedPaths.length) return { risk: 'normal', reasons: protectedPaths.map((n) => `protected path ${n}`) };
   if (author === 'dependabot[bot]') {
     const onlyDependabot = commitAuthors.length > 0 && commitAuthors.every((a) => a === 'dependabot[bot]');
     const onlyManifests = files.every((f) => isDependencyFile(f.filename));
@@ -74,9 +180,12 @@ function classify({ author, title, labels, files, commitAuthors = [] }) {
       ? { risk: 'low', reasons: ['dead-code removal: deletions only, no files removed'] }
       : { risk: 'normal', reasons: ['dead-code PR adds lines or deletes whole files'] };
   }
-  const results = files.map(classifyFile);
+  // A renamed file is low risk only if its old path would be too (src/x.ts → docs/x.md is not docs).
+  const results = files.flatMap((f) => (pathsOf(f).length > 1 ? [classifyFile(f), classifyFile({ ...f, filename: f.previous_filename })] : [classifyFile(f)]));
   const blockers = results.filter((r) => !r.low).map((r) => r.why);
-  return blockers.length ? { risk: 'normal', reasons: blockers } : { risk: 'low', reasons: [...new Set(results.map((r) => r.why))] };
+  if (!blockers.length) return { risk: 'low', reasons: [...new Set(results.map((r) => r.why))] };
+  const safe = agentSafe({ headRef, files, policy, issue });
+  return safe.ok ? { risk: 'agent', reasons: [safe.why] } : { risk: 'normal', reasons: [...blockers, safe.why] };
 }
 
 // Structured verdicts bound to a commit:
@@ -106,15 +215,41 @@ function verdictFor(item, headSha) {
 // feedback: comments and reviews ({ author, body, commitId? }). Review and
 // line comments carry commitId; a P0/P1 finding from a reviewer bot on the
 // head commit blocks even if a summary says otherwise.
-function reviewState({ labels, feedback, headSha }) {
+function reviewState({ labels, feedback, headSha, headRef }) {
   if (labels.includes('review:blocking')) return 'blocking';
+  // On a Codex-written PR the primary review must be Codex's own; a Claude
+  // verdict is the separate second review (secondReview), never both.
+  const codexPr = /^codex\//.test(headRef || '');
   // Codex's summary tracks whether its findings are resolved, so it is
   // authoritative for Codex; raw P0/P1 line findings only count for others.
   const findings = feedback.filter((x) => VERDICT_BOTS.has(x.author) && x.author !== CODEX_BOT && x.commitId === headSha && BLOCKING_FINDING.test(x.body || ''));
-  const verdicts = feedback.map((x) => verdictFor(x, headSha)).filter(Boolean);
-  if (findings.length || verdicts.includes('blocking')) return 'blocking';
+  // On a Codex PR, Claude's verdicts and findings belong to secondReview only,
+  // so overriding or clearing them can never stand in for Codex's own review.
+  const primary = codexPr ? feedback.filter((x) => x.author === CODEX_BOT) : feedback;
+  const verdicts = primary.map((x) => verdictFor(x, headSha)).filter(Boolean);
+  if ((!codexPr && findings.length) || verdicts.includes('blocking')) return 'blocking';
   if (verdicts.includes('pending')) return 'missing';
   return verdicts.includes('clear') ? 'clear' : 'missing';
+}
+
+// Second review for Codex-written PRs (portfolio-ops decision 0006). Codex
+// reviews every PR, so a `codex/` PR also needs a Claude review-verdict for its
+// head commit. Claude review sessions post through the owner's account, so a
+// verdict from the owner counts here (and only here) as well as one from
+// claude[bot]. Forging it can only reduce a Codex PR to Codex-only review (the
+// position before this rule); Codex's own clean review is still required, and
+// owner-account verdicts never count for any other PR.
+function secondReview({ headRef, feedback, headSha, owner }) {
+  if (!/^codex\//.test(headRef || '')) return 'not-needed';
+  const results = feedback
+    .filter((x) => x.author === 'claude[bot]' || (owner && x.author === owner))
+    .map((x) => parse(VERDICT, x.body))
+    .filter((v) => v && v.commit_sha === headSha)
+    .map((v) => v.result);
+  // claude[bot] P0/P1 line findings on the head commit block here too.
+  const findings = feedback.some((x) => x.author === 'claude[bot]' && x.commitId === headSha && BLOCKING_FINDING.test(x.body || ''));
+  if (findings || results.includes('blocking')) return 'blocking';
+  return results.includes('clear') ? 'clear' : 'missing';
 }
 
 // Approval: the latest `labeled` event for human-approved must be by the
@@ -142,15 +277,22 @@ function decide(input) {
   const overridden = raw === 'blocking' && reviewOverridden(input);
   const review = overridden ? 'clear' : raw;
   const approved = humanApproved(input);
+  const second = secondReview(input);
+  // review:override (owner, same rules as approval) also overrules a blocking Claude review.
+  const overridden2 = second === 'blocking' && reviewOverridden(input);
   let state; let description;
   if (input.draft) { state = 'pending'; description = 'Draft PR'; }
   else if (review === 'blocking') { state = 'failure'; description = 'Reviewer found P0/P1 issues on this commit (or review:blocking)'; }
   else if (review === 'missing') { state = 'pending'; description = 'Waiting for a completed review of this commit'; }
+  else if (second === 'blocking' && !overridden2) { state = 'failure'; description = 'Claude review of this Codex PR found P0/P1 issues'; }
+  // Jordan's own approval of this commit stands in for a missing Claude review.
+  else if (second === 'missing' && !approved) { state = 'pending'; description = 'Codex PR: waiting for the Claude review of this commit'; }
   else if (risk === 'low') { state = 'success'; description = overridden ? 'risk:low; review findings overridden by owner' : 'risk:low and reviewed'; }
+  else if (risk === 'agent') { state = 'success'; description = overridden ? 'risk:agent; review findings overridden by owner' : 'risk:agent (agent-safe) and reviewed'; }
   else if (approved) { state = 'success'; description = overridden ? 'human-approved; review findings overridden by owner' : 'human-approved and reviewed'; }
   else if (input.labels.includes('human-approved')) { state = 'pending'; description = 'risk:normal: approval predates this commit; remove and re-add human-approved'; }
   else { state = 'pending'; description = 'risk:normal: waiting for human-approved'; }
-  return { risk, reasons, review, overridden, approved, state, description };
+  return { risk, reasons, review, secondReview: second, overridden, approved, state, description };
 }
 
-module.exports = { ACTIONS_BOT, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
+module.exports = { ACTIONS_BOT, secondReview, pathsOf, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
