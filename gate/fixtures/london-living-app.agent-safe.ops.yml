@@ -1,0 +1,30 @@
+# Read by portfolio-ops jobs (dispatcher, scans, test review). Changes need human-approved.
+app: london-living-app
+web: true
+install: cd app && npm ci
+data: { fetch: scripts/fetch_app_data.sh, source: github-release, tag: data-latest, fallback: app-data branch, into: data/processed/discovery }
+verify: cd app && npm run lint && npm run check && npm run test:unit -- --run
+e2e: cd app && npm run test:e2e
+coverage: cd app && npx vitest run --coverage
+dead_code: { tool: knip, paths: [app], ignore: ["app/src/routes/**"] }
+mutation: { tool: stryker, paths: [app/src/lib] }
+# Agent-safe tier (portfolio-ops decision 0005): agent PRs for queued, non-pivotal
+# issues merge without human-approved unless they touch a path below.
+agent_safe: true
+agent_max_lines: 400
+sensitive_paths:            # always need human-approved
+  - app/src/routes/api/     # server endpoints (LLM proxy)
+  - app/src/lib/scoring/    # how areas are scored: wrong numbers mislead users
+  - app/src/lib/duckdb.ts   # data loading
+  - app/src/lib/context-loader.ts
+  - scripts/                # data pipeline
+  - sql/
+  - src/
+  - evidence/               # the existing Evidence app must keep building
+  - data/
+  - Dockerfile
+  - Makefile
+pivotal_paths:              # core journey structure: Jordan sees changes first
+  - app/src/routes/+page.svelte
+  - app/src/routes/+layout.svelte
+  - app/src/lib/components/QuizFlow.svelte

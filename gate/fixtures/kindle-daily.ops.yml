@@ -1,0 +1,8 @@
+# Read by portfolio-ops jobs (dispatcher, scans, test review). Changes need human-approved.
+app: kindle-daily
+web: false
+install: uv sync --locked
+verify: uv run ruff check . && uv run ruff format --check . && uv run pytest && node --test worker/test/*.test.js
+coverage: uv run pytest --cov=src --cov-report=json
+dead_code: { tool: vulture, paths: [src], ignore: [] }
+mutation: { tool: mutmut, paths: [src] }

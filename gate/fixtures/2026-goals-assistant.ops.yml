@@ -1,0 +1,9 @@
+# Read by portfolio-ops jobs (dispatcher, scans, test review). Changes need human-approved.
+app: 2026-goals-assistant
+web: true
+install: npm ci
+verify: npm run verify:changed -- --explain
+e2e: npm run test:e2e
+coverage: npx c8 --reporter=json-summary npm test
+dead_code: { tool: knip, paths: [src, web], ignore: ["web/app/**/page.tsx", "web/app/**/layout.tsx", "scripts/**"] }
+mutation: { tool: stryker, paths: [src] }

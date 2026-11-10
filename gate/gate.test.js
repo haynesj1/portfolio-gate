@@ -357,3 +357,16 @@ test('test removals are caught in any language and any file (Codex P2)', () => {
   // Go test files are recognised as tests (added tests alone are low risk)
   assert.equal(g.classify({ ...base, files: [f('pkg/a_test.go', '+func TestNew(t *testing.T) {}')] }).risk, 'low');
 });
+
+// ---- real app .ops.yml files (copied into gate/fixtures) -------------------
+test('every real app .ops.yml parses: today without the tier, and with the proposed policy', () => {
+  const fs = require('node:fs'); const path = require('node:path');
+  const dir = path.join(__dirname, 'fixtures');
+  for (const name of fs.readdirSync(dir)) {
+    const p = g.parseOpsPolicy(fs.readFileSync(path.join(dir, name), 'utf8'));
+    assert.equal(p.invalid, undefined, `${name}: ${p.invalid}`);
+    assert.equal(p.agentSafe, name.includes('.agent-safe.'), name);
+  }
+  const london = g.parseOpsPolicy(fs.readFileSync(path.join(dir, 'london-living-app.agent-safe.ops.yml'), 'utf8'));
+  assert.ok(london.sensitive.includes('app/src/lib/scoring/') && london.pivotal.includes('app/src/lib/components/QuizFlow.svelte'));
+});

@@ -101,7 +101,7 @@ jobs:
                   const line = raw.replace(/\s+#.*$/, '');
                   const item = /^\s*-\s*["']?([^"']+?)["']?\s*$/.exec(line);
                   if (list && item) { policy[list].push(item[1]); continue; }
-                  const kv = /^([a-z_]+):(?:\s+(.*))?$/.exec(line);
+                  const kv = /^([a-z][a-z0-9_]*):(?:\s+(.*))?$/.exec(line);
                   if (!kv) return off(`unreadable line: ${line.trim()}`);
                   list = null;
                   const key = kv[1]; const value = (kv[2] || '').trim();

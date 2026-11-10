@@ -1,0 +1,25 @@
+# Read by portfolio-ops jobs (dispatcher, scans, test review). Changes need human-approved.
+app: kindle-daily
+web: false
+install: uv sync --locked
+verify: uv run ruff check . && uv run ruff format --check . && uv run pytest && node --test worker/test/*.test.js
+coverage: uv run pytest --cov=src --cov-report=json
+dead_code: { tool: vulture, paths: [src], ignore: [] }
+mutation: { tool: mutmut, paths: [src] }
+# Agent-safe tier (portfolio-ops decision 0005): agent PRs for queued, non-pivotal
+# issues merge without human-approved unless they touch a path below.
+agent_safe: true
+agent_max_lines: 400
+sensitive_paths:            # always need human-approved
+  - src/kindle_daily/mailer.py     # sending email
+  - src/kindle_daily/config.py
+  - src/kindle_daily/feedback.py   # updates preferences after approval
+  - preferences.md                 # personal
+  - feeds.toml                     # which sources are read
+  - config.toml
+  - worker/                        # ratings worker (signature must match Python)
+  - data/                          # written by scheduled workflows
+pivotal_paths:              # how the daily issue looks: Jordan sees changes first
+  - src/kindle_daily/epub.py
+  - src/kindle_daily/sections.py
+  - src/kindle_daily/cover.py
