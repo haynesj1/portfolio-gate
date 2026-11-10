@@ -1,0 +1,7 @@
+# Read by portfolio-ops jobs (dispatcher, scans, test review). Changes need human-approved.
+app: clear80
+web: false
+verify: ./gradlew testDebugUnitTest lintDebug compileDebugAndroidTestKotlin assembleDebug
+coverage: ./gradlew testDebugUnitTest  # Kover/JaCoCo to be added
+dead_code: { tool: android-lint-unused, paths: [app/src/main], ignore: [] }
+mutation: { tool: pitest, paths: [app/src/main] }

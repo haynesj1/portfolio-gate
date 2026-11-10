@@ -1,0 +1,4 @@
+# Read by portfolio-ops jobs (dispatcher, scans, test review). Changes need human-approved.
+app: the-island
+web: true
+# install, verify, e2e, coverage, dead_code and mutation are filled in by the scaffold issue.

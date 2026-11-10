@@ -81,7 +81,7 @@ function parseOpsPolicy(text) {
     const line = raw.replace(/\s+#.*$/, '');
     const item = /^\s*-\s*["']?([^"']+?)["']?\s*$/.exec(line);
     if (list && item) { policy[list].push(item[1]); continue; }
-    const kv = /^([a-z_]+):(?:\s+(.*))?$/.exec(line);
+    const kv = /^([a-z][a-z0-9_]*):(?:\s+(.*))?$/.exec(line);
     if (!kv) return off(`unreadable line: ${line.trim()}`);
     list = null;
     const key = kv[1]; const value = (kv[2] || '').trim();
@@ -285,7 +285,7 @@ function decide(input) {
   else if (review === 'blocking') { state = 'failure'; description = 'Reviewer found P0/P1 issues on this commit (or review:blocking)'; }
   else if (review === 'missing') { state = 'pending'; description = 'Waiting for a completed review of this commit'; }
   else if (second === 'blocking' && !overridden2) { state = 'failure'; description = 'Claude review of this Codex PR found P0/P1 issues'; }
-  // Jordan's own approval of this commit stands in for a missing Claude review.
+  // The owner's own approval of this commit stands in for a missing Claude review.
   else if (second === 'missing' && !approved) { state = 'pending'; description = 'Codex PR: waiting for the Claude review of this commit'; }
   else if (risk === 'low') { state = 'success'; description = overridden ? 'risk:low; review findings overridden by owner' : 'risk:low and reviewed'; }
   else if (risk === 'agent') { state = 'success'; description = overridden ? 'risk:agent; review findings overridden by owner' : 'risk:agent (agent-safe) and reviewed'; }

@@ -1,0 +1,10 @@
+# Read by portfolio-ops jobs (dispatcher, scans, test review). Changes need human-approved.
+app: london-living-app
+web: true
+install: cd app && npm ci
+data: { fetch: scripts/fetch_app_data.sh, source: github-release, tag: data-latest, fallback: app-data branch, into: data/processed/discovery }
+verify: cd app && npm run lint && npm run check && npm run test:unit -- --run
+e2e: cd app && npm run test:e2e
+coverage: cd app && npx vitest run --coverage
+dead_code: { tool: knip, paths: [app], ignore: ["app/src/routes/**"] }
+mutation: { tool: stryker, paths: [app/src/lib] }

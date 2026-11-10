@@ -176,7 +176,7 @@ test('caller comment filter: review results evaluate, other comments are skipped
   assert.equal(onComment('<!-- review-verdict:v1 {"commit_sha":"abc","result":"blocking"} -->'), true);
   // Ordinary comments, PR summaries and comments on plain issues are skipped.
   assert.equal(onComment('Fixed in the latest push.'), false);
-  assert.equal(onComment('<!-- pr-summary:v1 -->\n## Summary for Jordan'), false);
+  assert.equal(onComment('<!-- pr-summary:v1 -->\n## Summary for the owner'), false);
   assert.equal(onComment(codex('{"code_review":{"status":"completed"}}'), false), false);
   // An edit that removes a verdict or Codex summary still evaluates, so the gate
   // recomputes; an edit between two ordinary bodies is skipped.
