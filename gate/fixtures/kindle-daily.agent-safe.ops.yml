@@ -19,7 +19,7 @@ sensitive_paths:            # always need human-approved
   - config.toml
   - worker/                        # ratings worker (signature must match Python)
   - data/                          # written by scheduled workflows
-pivotal_paths:              # how the daily issue looks: Jordan sees changes first
+pivotal_paths:              # how the daily issue looks: the owner sees changes first
   - src/kindle_daily/epub.py
   - src/kindle_daily/sections.py
   - src/kindle_daily/cover.py

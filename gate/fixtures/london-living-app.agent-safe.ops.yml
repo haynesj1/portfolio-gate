@@ -24,7 +24,7 @@ sensitive_paths:            # always need human-approved
   - data/
   - Dockerfile
   - Makefile
-pivotal_paths:              # core journey structure: Jordan sees changes first
+pivotal_paths:              # core journey structure: the owner sees changes first
   - app/src/routes/+page.svelte
   - app/src/routes/+layout.svelte
   - app/src/lib/components/QuizFlow.svelte
