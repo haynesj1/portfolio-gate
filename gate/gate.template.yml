@@ -126,6 +126,7 @@ __GATE_JS__
               }
               await core.summary.addHeading(`review-gate: ${result.state}`).addList([
                 `risk: ${result.risk} (${result.reasons.join('; ')})`, `review: ${result.review}`, `human-approved: ${result.approved}`,
+                ...(result.agentWhy ? [`kept out of risk:agent by: ${result.agentWhy}`] : []),
               ]).write();
             }
             if (context.eventName === 'push') {

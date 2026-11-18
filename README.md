@@ -35,6 +35,8 @@ pivotal_paths:         # core-journey UI that the owner wants to see first
   - "src/routes/reveal/**"
 ```
 
+When a PR is `risk:normal`, the `review-gate` status description ends with ` — <reason>`, the one rule that kept it out of `risk:agent` (shortened to fit GitHub's 140-character limit), and the job summary repeats it as `kept out of risk:agent by: <reason>`.
+
 Policy parsing fails closed: blank lines and comments inside a path list are skipped, and any line the gate can't read switches the tier off for that repo (everything is `risk:normal`).
 
 Because the tier depends on the linked issue, the caller also listens to `issues` events (closed, reopened, or a `ready` / `in-progress` / `pivotal` label change) and re-evaluates the open PRs that implement that issue. Marking an issue `pivotal` therefore withdraws an earlier agent-safe pass at once. Runs for the same PR can overlap (PR, comment and issue events use different concurrency groups), so any run that publishes a pass re-gathers every input from GitHub afterwards and decides again, republishing if the answer changed. The last writer has therefore always read every input after the last change. A change to `.ops.yml` on the default branch re-evaluates every open agent PR under the new policy: the caller has one narrow `push` trigger (default branch, `.ops.yml` only). Default-branch pushes only happen by merging a reviewed PR, so this runs trusted code. A push to any other branch runs that branch's own workflow files whatever the default caller says, so the trigger adds no new exposure. A test pins the trigger to exactly that shape. Merge this repo's gate change **before** syncing the caller to app repos, or the older gate will fail on issue events.

@@ -206,6 +206,7 @@ test('workflow: without .ops.yml opt-in the same PR still needs approval', async
   const h = harness({ headRef: 'claude/7', issue: { number: 7, state: 'open', labels: [{ name: 'ready' }] }, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
   await h.run();
   assert.equal(h.gate().state, 'pending');
+  assert.equal(h.gate().description, 'risk:normal: waiting for human-approved \u2014 agent-safe tier not enabled for this repo');
   assert.deepEqual(h.added, ['risk:normal']);
 });
 

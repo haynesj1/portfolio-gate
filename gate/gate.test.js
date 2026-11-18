@@ -370,3 +370,67 @@ test('every real app .ops.yml parses: today without the tier, and with the propo
   const london = g.parseOpsPolicy(fs.readFileSync(path.join(dir, 'london-living-app.agent-safe.ops.yml'), 'utf8'));
   assert.ok(london.sensitive.includes('app/src/lib/scoring/') && london.pivotal.includes('app/src/lib/components/QuizFlow.svelte'));
 });
+
+// ---- status description says which rule kept a PR out of risk:agent ------
+const WAIT = 'risk:normal: waiting for human-approved';
+const STALE = 'risk:normal: approval predates this commit; remove and re-add human-approved';
+const descOf = (over) => g.decide({ ...agentPr, ...over }).description;
+
+test('description: each agentSafe rule names itself after the unchanged fixed text', () => {
+  const cases = [
+    [{ policy: g.parseOpsPolicy('app: x') }, 'agent-safe tier not enabled for this repo'],
+    [{ headRef: 'feature/7' }, 'not an agent branch'],
+    [{ issue: null }, 'no linked issue'],
+    [{ issue: { ...queued, state: 'closed' } }, 'linked issue is not open'],
+    [{ issue: { ...queued, labels: ['agent:claude'] } }, 'linked issue was not queued (ready)'],
+    [{ issue: { ...queued, labels: ['ready', 'pivotal'] } }, 'linked issue is pivotal'],
+    [{ files: [f('package.json')] }, 'dependency or package-manager file package.json'],
+    [{ files: [f('src/auth/login.ts')] }, 'sensitive path src/auth/login.ts'],
+    [{ files: [f('src/routes/reveal/x.ts')] }, 'pivotal path src/routes/reveal/x.ts'],
+    [{ files: [f('src/old.ts', '', { status: 'removed' })] }, 'file deleted: src/old.ts'],
+    [{ files: [f('src/a.test.ts', "-it('works', () => {})")] }, 'test or assertion line removed in src/a.test.ts'],
+    [{ files: [f('src/a.ts', '+x', { additions: 250, deletions: 51 })] }, '301 lines changed (cap 300)'],
+  ];
+  for (const [over, why] of cases) {
+    assert.equal(g.classify({ ...agentPr, ...over }).agentWhy, why);
+    assert.equal(descOf(over), `${WAIT} — ${why}`);
+  }
+});
+
+test('description: protected path, dependabot and dead-code reasons come from classify', () => {
+  assert.equal(descOf({ files: [f('.github/workflows/ci.yml')] }), `${WAIT} — protected path .github/workflows/ci.yml`);
+  const dep = { ...base, author: 'dependabot[bot]', title: 'Bump a from 1.2.3 to 1.3.0', commitAuthors: ['dependabot[bot]'], files: [f('package.json')] };
+  assert.equal(g.decide(dep).description, `${WAIT} — dependency change that is not a pure Dependabot patch bump`);
+  const dead = { ...base, labels: ['type:dead-code'], files: [f('src/a.ts', '+x', { additions: 3 })] };
+  assert.equal(g.decide(dead).description, `${WAIT} — dead-code PR adds lines or deletes whole files`);
+});
+
+test('description: non-agent branch, and the stale-approval text keeps its prefix', () => {
+  assert.equal(g.decide({ ...base, headRef: 'feature/x', policy, issue: queued }).description, `${WAIT} — not an agent branch`);
+  const stale = g.decide({ ...agentPr, policy: null, labels: ['human-approved'], labelEvents: [label('2026-11-06T09:00:00Z')] }).description;
+  assert.equal(stale, `${STALE} — agent-safe tier not enabled for this repo`);
+});
+
+test('description: a long reason is shortened so the fixed text is never cut and the total is at most 140', () => {
+  const long = `src/routes/reveal/${'deeply/'.repeat(20)}component.ts`;
+  for (const [over, fixed] of [[{}, WAIT], [{ labels: ['human-approved'], labelEvents: [label('2026-11-06T09:00:00Z')] }, STALE]]) {
+    const d = g.decide({ ...agentPr, ...over, files: [f(long)] }).description;
+    assert.ok(d.length <= 140, `${d.length}`);
+    assert.ok(d.startsWith(`${fixed} — pivotal path …`), d);
+    assert.ok(d.endsWith('/component.ts'), d);
+  }
+  // A non-path reason is cut at its end with an ellipsis.
+  const d = g.decide({ ...agentPr, issue: null, headRef: `claude/${'9'.repeat(200)}`, policy: g.parseOpsPolicy('app: x') }).description;
+  assert.ok(d.length <= 140 && d.startsWith(WAIT));
+});
+
+test('description: risk:low, risk:agent and other descriptions are unchanged, agentWhy is null', () => {
+  const low = g.decide({ ...base, files: [f('README.md')] });
+  assert.equal(low.description, 'risk:low and reviewed');
+  assert.equal(low.agentWhy, null);
+  const agent = g.decide(agentPr);
+  assert.equal(agent.description, 'risk:agent (agent-safe) and reviewed');
+  assert.equal(agent.agentWhy, null);
+  assert.equal(g.decide({ ...agentPr, feedback: [] }).description, 'Waiting for a completed review of this commit');
+  assert.equal(g.decide({ ...agentPr, draft: true }).description, 'Draft PR');
+});

@@ -186,26 +186,26 @@ jobs:
               // pushed onto a Dependabot branch by anyone else loses the Dependabot path.
               function classify({ author, title, labels, files, commitAuthors = [], headRef, policy, issue }) {
                 const protectedPaths = files.flatMap(pathsOf).filter(isProtected);
-                if (protectedPaths.length) return { risk: 'normal', reasons: protectedPaths.map((n) => `protected path ${n}`) };
+                if (protectedPaths.length) { const reasons = protectedPaths.map((n) => `protected path ${n}`); return { risk: 'normal', reasons, agentWhy: reasons[0] }; }
                 if (author === 'dependabot[bot]') {
                   const onlyDependabot = commitAuthors.length > 0 && commitAuthors.every((a) => a === 'dependabot[bot]');
                   const onlyManifests = files.every((f) => isDependencyFile(f.filename));
                   return isPatchBump(title) && onlyDependabot && onlyManifests
-                    ? { risk: 'low', reasons: ['dependency patch bump (Dependabot commits, manifests only)'] }
-                    : { risk: 'normal', reasons: ['dependency change that is not a pure Dependabot patch bump'] };
+                    ? { risk: 'low', reasons: ['dependency patch bump (Dependabot commits, manifests only)'], agentWhy: null }
+                    : { risk: 'normal', reasons: ['dependency change that is not a pure Dependabot patch bump'], agentWhy: 'dependency change that is not a pure Dependabot patch bump' };
                 }
                 if (labels.includes('type:dead-code')) {
                   const onlyDeletes = files.every((f) => f.status !== 'removed' && f.additions === 0);
                   return onlyDeletes
-                    ? { risk: 'low', reasons: ['dead-code removal: deletions only, no files removed'] }
-                    : { risk: 'normal', reasons: ['dead-code PR adds lines or deletes whole files'] };
+                    ? { risk: 'low', reasons: ['dead-code removal: deletions only, no files removed'], agentWhy: null }
+                    : { risk: 'normal', reasons: ['dead-code PR adds lines or deletes whole files'], agentWhy: 'dead-code PR adds lines or deletes whole files' };
                 }
                 // A renamed file is low risk only if its old path would be too (src/x.ts → docs/x.md is not docs).
                 const results = files.flatMap((f) => (pathsOf(f).length > 1 ? [classifyFile(f), classifyFile({ ...f, filename: f.previous_filename })] : [classifyFile(f)]));
                 const blockers = results.filter((r) => !r.low).map((r) => r.why);
-                if (!blockers.length) return { risk: 'low', reasons: [...new Set(results.map((r) => r.why))] };
+                if (!blockers.length) return { risk: 'low', reasons: [...new Set(results.map((r) => r.why))], agentWhy: null };
                 const safe = agentSafe({ headRef, files, policy, issue });
-                return safe.ok ? { risk: 'agent', reasons: [safe.why] } : { risk: 'normal', reasons: [...blockers, safe.why] };
+                return safe.ok ? { risk: 'agent', reasons: [safe.why], agentWhy: null } : { risk: 'normal', reasons: [...blockers, safe.why], agentWhy: safe.why };
               }
 
               // Structured verdicts bound to a commit:
@@ -291,8 +291,26 @@ jobs:
               // It does not replace approval for risk:normal PRs.
               const reviewOverridden = (input) => ownerLabelled('review:override', input);
 
+              // GitHub caps a status description at 140 characters. The fixed text is never
+              // cut: the reason is shortened to fit, ending with an ellipsis. A long path is
+              // shortened from the left so the file name survives.
+              const DESCRIPTION_MAX = 140;
+              function withReason(fixed, why) {
+                if (!why) return fixed;
+                const room = DESCRIPTION_MAX - fixed.length - ' \u2014 '.length;
+                let reason = String(why).replace(/\s+/g, ' ');
+                if (reason.length > room) {
+                  const m = /^(.*?)(\S*\/\S*)$/.exec(reason);
+                  if (m && room > m[1].length + 2) {
+                    const keep = room - m[1].length - 1; // one char for the ellipsis
+                    reason = m[1] + '\u2026' + m[2].slice(-keep);
+                  } else reason = room > 1 ? reason.slice(0, room - 1) + '\u2026' : '';
+                }
+                return reason ? `${fixed} \u2014 ${reason}` : fixed;
+              }
+
               function decide(input) {
-                const { risk, reasons } = classify(input);
+                const { risk, reasons, agentWhy = null } = classify(input);
                 const raw = reviewState(input);
                 const overridden = raw === 'blocking' && reviewOverridden(input);
                 const review = overridden ? 'clear' : raw;
@@ -310,9 +328,9 @@ jobs:
                 else if (risk === 'low') { state = 'success'; description = overridden ? 'risk:low; review findings overridden by owner' : 'risk:low and reviewed'; }
                 else if (risk === 'agent') { state = 'success'; description = overridden ? 'risk:agent; review findings overridden by owner' : 'risk:agent (agent-safe) and reviewed'; }
                 else if (approved) { state = 'success'; description = overridden ? 'human-approved; review findings overridden by owner' : 'human-approved and reviewed'; }
-                else if (input.labels.includes('human-approved')) { state = 'pending'; description = 'risk:normal: approval predates this commit; remove and re-add human-approved'; }
-                else { state = 'pending'; description = 'risk:normal: waiting for human-approved'; }
-                return { risk, reasons, review, secondReview: second, overridden, approved, state, description };
+                else if (input.labels.includes('human-approved')) { state = 'pending'; description = withReason('risk:normal: approval predates this commit; remove and re-add human-approved', agentWhy); }
+                else { state = 'pending'; description = withReason('risk:normal: waiting for human-approved', agentWhy); }
+                return { risk, reasons, agentWhy, review, secondReview: second, overridden, approved, state, description };
               }
 
               module.exports = { ACTIONS_BOT, secondReview, pathsOf, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
@@ -424,6 +442,7 @@ jobs:
               }
               await core.summary.addHeading(`review-gate: ${result.state}`).addList([
                 `risk: ${result.risk} (${result.reasons.join('; ')})`, `review: ${result.review}`, `human-approved: ${result.approved}`,
+                ...(result.agentWhy ? [`kept out of risk:agent by: ${result.agentWhy}`] : []),
               ]).write();
             }
             if (context.eventName === 'push') {
