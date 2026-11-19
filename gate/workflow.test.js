@@ -183,8 +183,8 @@ test('caller comment filter: review results evaluate, other comments are skipped
   assert.equal(onComment('Withdrawn: re-reviewing.', true, '<!-- review-verdict:v1 {"commit_sha":"abc","result":"clear"} -->'), true);
   assert.equal(onComment('gone', true, codex('{"code_review":{"status":"completed"}}')), true);
   assert.equal(onComment('Fixed now.', true, 'Fixed in the latest push.'), false);
-  // PR events always evaluate.
-  for (const event_name of ['pull_request_target']) assert.equal(run({ event_name, event: {} }), true);
+  // PR events: opened, synchronize and the like always evaluate (see the PR filter test below).
+  for (const event_name of ['pull_request_target', 'push']) assert.equal(run({ event_name, event: {} }), true);
   // Issue events evaluate only when they can change the agent-safe tier.
   const onIssue = (action, label, pr = false) => run({ event_name: 'issues', event: { action, label: label ? { name: label } : undefined, issue: pr ? { pull_request: { url: 'x' } } : {} } });
   assert.equal(onIssue('closed'), true);
@@ -192,6 +192,41 @@ test('caller comment filter: review results evaluate, other comments are skipped
   for (const l of ['ready', 'in-progress', 'pivotal']) { assert.equal(onIssue('labeled', l), true); assert.equal(onIssue('unlabeled', l), true); }
   assert.equal(onIssue('labeled', 'size:S'), false);
   assert.equal(onIssue('labeled', 'human-approved', true), false);
+});
+
+// The same real `if` expression, for pull_request_target label changes and edits.
+test('caller PR filter: unread label changes and title-only edits are skipped', () => {
+  const callerYml = fs.readFileSync(path.join(__dirname, '..', 'caller', 'pr-gate.yml'), 'utf8');
+  const lines = callerYml.split('\n');
+  const start = lines.findIndex((l) => /^\s+if: >-$/.test(l));
+  const expr = lines.slice(start + 1).filter((l, i, a) => a.slice(0, i + 1).every((x) => /^\s{6}/.test(x))).join(' ');
+  const contains = (hay, needle) => String(hay ?? '').toLowerCase().includes(String(needle).toLowerCase());
+  const js = expr.replace(/github(\.\w+)+/g, (m) => m.replace(/\./g, '?.'));
+  const run = (github) => Boolean(new Function('github', 'contains', `return (${js});`)(github, contains));
+  const pr = (action, extra = {}, author = 'octocat') => run({ event_name: 'pull_request_target', event: { action, pull_request: { user: { login: author } }, ...extra } });
+  const label = (action, name) => pr(action, name === undefined ? {} : { label: { name } });
+  for (const l of ['human-approved', 'review:override', 'review:blocking', 'type:dead-code', 'risk:low', 'risk:agent', 'risk:normal']) {
+    assert.equal(label('labeled', l), true, `labeled ${l}`);
+    assert.equal(label('unlabeled', l), true, `unlabeled ${l}`);
+  }
+  for (const l of ['queue', 'size:S', 'enhancement']) {
+    assert.equal(label('labeled', l), false, `labeled ${l}`);
+    assert.equal(label('unlabeled', l), false, `unlabeled ${l}`);
+  }
+  assert.equal(label('labeled'), true);
+  assert.equal(label('unlabeled'), true);
+  const edit = (changes, author) => pr('edited', changes === undefined ? {} : { changes }, author);
+  assert.equal(edit({ title: { from: 'Old' } }), false);
+  assert.equal(edit({ title: { from: '' } }), false);
+  assert.equal(edit({ title: { from: 'Old' } }, 'dependabot[bot]'), true);
+  assert.equal(edit({ body: { from: '' } }), true);
+  assert.equal(edit({ body: { from: 'Closes #3' } }), true);
+  assert.equal(edit({ title: { from: 'Old' }, body: { from: '' } }), true);
+  assert.equal(edit({ base: { ref: { from: 'main' } } }), true);
+  assert.equal(edit({ title: { from: 'Old' }, base: { ref: { from: 'main' } } }), true);
+  assert.equal(edit(undefined), true);
+  assert.equal(edit({}), true);
+  for (const a of ['opened', 'synchronize', 'reopened', 'ready_for_review', 'converted_to_draft']) assert.equal(pr(a), true, a);
 });
 
 test('workflow: agent-safe PR passes without approval, reading .ops.yml from the default branch', async () => {
