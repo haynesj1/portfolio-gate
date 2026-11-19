@@ -225,6 +225,9 @@ test('caller PR filter: unread label changes and title-only edits are skipped', 
   assert.equal(edit({ base: { ref: { from: 'main' } } }), true);
   assert.equal(edit({ title: { from: 'Old' }, base: { ref: { from: 'main' } } }), true);
   assert.equal(edit(undefined), true);
+  // A payload with no author must evaluate, not skip.
+  assert.equal(run({ event_name: 'pull_request_target', event: { action: 'edited', changes: { title: { from: 'Old' } } } }), true);
+  assert.equal(run({ event_name: 'pull_request_target', event: { action: 'edited', changes: { title: { from: 'Old' } }, pull_request: { user: {} } } }), true);
   assert.equal(edit({}), true);
   for (const a of ['opened', 'synchronize', 'reopened', 'ready_for_review', 'converted_to_draft']) assert.equal(pr(a), true, a);
 });
