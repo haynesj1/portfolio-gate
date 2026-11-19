@@ -300,7 +300,7 @@ function decide(input) {
   const overridden2 = second === 'blocking' && reviewOverridden(input);
   let state; let description;
   if (input.draft) { state = 'pending'; description = 'Draft PR'; }
-  else if (review === 'blocking') { state = 'failure'; description = 'Reviewer found P0/P1 issues on this commit (or review:blocking)'; }
+  else if (review === 'blocking') { state = 'failure'; description = 'Reviewer has unresolved findings on this commit (or review:blocking)'; }
   else if (review === 'missing') { state = 'pending'; description = 'Waiting for a completed review of this commit'; }
   else if (second === 'blocking' && !overridden2) { state = 'failure'; description = 'Claude review of this Codex PR found P0/P1 issues'; }
   // The owner's own approval of this commit stands in for a missing Claude review.
