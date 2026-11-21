@@ -58,6 +58,8 @@ Reviewers can be wrong, so the owner can overrule blocking findings for the curr
 
 Known residual risk: agent apps with the Workflows permission could add a workflow that writes an Actions-attributed status. Mitigated by tool permissions, provenance links on every status, and a daily audit of merged PRs.
 
+The caller skips two kinds of pull request event that cannot change the gate's answer, so no runner starts (a skipped job uses no Actions minutes). A label change is skipped unless the label is `human-approved`, `review:override`, `review:blocking`, `type:dead-code`, `risk:low`, `risk:agent` or `risk:normal`; adding and removing are treated alike, and a label event with no label name evaluates. An edit is skipped only when it changed the title and nothing else (no body, no base branch) and the author is not Dependabot, whose title the gate reads. Every other edit and every other PR action evaluates.
+
 ## Use
 
 Copy [`caller/pr-gate.yml`](caller/pr-gate.yml) to `.github/workflows/pr-gate.yml`, then require the `review-gate` status (source: GitHub Actions) in a ruleset.

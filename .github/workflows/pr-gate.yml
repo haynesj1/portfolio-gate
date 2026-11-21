@@ -37,14 +37,33 @@ jobs:
     # (replies, PR summaries, triage notes) are skipped, and a skipped job uses no
     # Actions minutes. Codex summaries always evaluate, whatever their status or
     # JSON spacing: the gate's own parser decides what they mean, so this filter
-    # can never hide a review result. PR events (push, labels, ready) always
-    # evaluate. An edit that removes a review result also evaluates (the previous
+    # can never hide a review result. PR events (opened, push, ready, draft)
+    # always evaluate, with two exceptions. A label change is skipped unless the
+    # label is one the gate reads or writes (human-approved, review:override,
+    # review:blocking, type:dead-code, risk:low, risk:agent, risk:normal); adding
+    # and removing are treated alike, and an event with no label name evaluates.
+    # A PR edit is skipped only when it changed the title and nothing else (no
+    # body, no base branch) and the author is not Dependabot, whose title the gate
+    # reads. Any other edit evaluates, including a body edit from an empty body.
+    # An edit that removes a review result also evaluates (the previous
     # body is checked too), so withdrawn evidence is recomputed at once.
     # Issue events evaluate only when they can change the agent-safe tier: the
     # issue closed or reopened, or its ready / in-progress / pivotal label changed.
-    # Tested in gate/workflow.test.js ("caller comment filter").
+    # Tested in gate/workflow.test.js ("caller comment filter" and "caller PR filter").
     if: >-
-      (github.event_name != 'issue_comment' && github.event_name != 'issues') ||
+      (github.event_name != 'issue_comment' && github.event_name != 'issues' &&
+       github.event_name != 'pull_request_target') ||
+      (github.event_name == 'pull_request_target' &&
+       !(((github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+          github.event.label.name &&
+          github.event.label.name != 'human-approved' && github.event.label.name != 'review:override' &&
+          github.event.label.name != 'review:blocking' && github.event.label.name != 'type:dead-code' &&
+          github.event.label.name != 'risk:low' && github.event.label.name != 'risk:agent' &&
+          github.event.label.name != 'risk:normal') ||
+         (github.event.action == 'edited' && github.event.changes.title &&
+          !github.event.changes.body && !github.event.changes.base &&
+          github.event.pull_request.user.login &&
+          github.event.pull_request.user.login != 'dependabot[bot]'))) ||
       (github.event_name == 'issues' && !github.event.issue.pull_request &&
        (github.event.action == 'closed' || github.event.action == 'reopened' ||
         github.event.label.name == 'ready' || github.event.label.name == 'in-progress' ||
