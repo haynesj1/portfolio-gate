@@ -460,3 +460,180 @@ test('a Codex review with unresolved findings (any severity) fails with the unre
   assert.equal(d.state, 'failure');
   assert.equal(d.description, 'Reviewer has unresolved findings on this commit (or review:blocking)');
 });
+
+// ---- answered reviewer findings (issue #14) --------------------------------
+const CODEX_BOT = 'chatgpt-codex-connector[bot]';
+const UNRESOLVED = 'Reviewer has unresolved findings on this commit (or review:blocking)';
+const ANSWERED_WAIT = 'risk:normal: waiting for human-approved — reviewer findings answered, not resolved';
+const ANSWERED_OK = 'human-approved; reviewer findings answered, not resolved';
+const NO_TIER = 'agent-safe tier not enabled for this repo';
+// A Codex line finding (thread root) and a reply in its thread.
+const cFinding = (id, commit = `C${id}`, at = '2026-11-06T09:00:00Z', p = 'P1') => ({
+  author: CODEX_BOT, id, commitId: 'H', originalCommitId: commit, createdAt: at,
+  body: `**![${p} Badge](https://img.shields.io/badge/${p}-orange?style=flat)** Problem ${id}`,
+});
+const cReply = (to, { at = '2026-11-06T09:30:00Z', author = OWNER, id = to + 1000, commit = 'C9' } = {}) => ({
+  author, id, inReplyToId: to, commitId: 'H', originalCommitId: commit, createdAt: at, body: 'Fixed in a later commit.',
+});
+const sixAnswered = [1, 2, 3, 4, 5, 6].flatMap((i) => [cFinding(i), cReply(i)]);
+const answeredPr = { ...base, feedback: [codex('H', true), ...sixAnswered] };
+const approvedNow = { labels: ['human-approved'], labelEvents: [label('2026-11-06T10:05:00Z')] };
+const expectState = (input, state, description) => {
+  const d = g.decide(input);
+  assert.equal(d.state, state);
+  assert.equal(d.description, description);
+  return d;
+};
+
+test('answered: six answered findings from earlier commits, risk:normal, not approved, waits for human-approved', () => {
+  assert.equal(g.reviewState(answeredPr), 'answered');
+  const d = expectState(answeredPr, 'pending', `${ANSWERED_WAIT} — ${NO_TIER}`);
+  assert.equal(d.review, 'answered');
+  assert.equal(d.risk, 'normal');
+  // The agent-tier reason is appended where there is room, and shortened to fit 140 characters.
+  expectState({ ...answeredPr, author: 'dependabot[bot]', title: 'Bump a from 1.2.3 to 1.3.0', commitAuthors: ['dependabot[bot]'], files: [f('package.json')] },
+    'pending', `${ANSWERED_WAIT} — dependency change that is not a pure Dependabot patch bump`.slice(0, 139) + '…');
+  const long = g.decide({ ...answeredPr, headRef: 'claude/7', policy, issue: queued, files: [f(`src/routes/reveal/${'deeply/'.repeat(20)}x.ts`)] }).description;
+  assert.ok(long.length <= 140 && long.startsWith(`${ANSWERED_WAIT} — pivotal path …`), long);
+});
+
+test('answered: the same, approved for this commit, passes', () => {
+  const d = expectState({ ...answeredPr, ...approvedNow }, 'success', ANSWERED_OK);
+  assert.equal(d.review, 'answered');
+  // an approval for an older commit does not
+  expectState({ ...answeredPr, labels: ['human-approved'], labelEvents: [label('2026-11-06T09:00:00Z')] }, 'pending',
+    `risk:normal: approval predates this commit; remove and re-add human-approved — ${NO_TIER}`);
+});
+
+test('answered: risk:agent and risk:low PRs fail as today, approved or not', () => {
+  for (const pr of [{ ...agentPr, feedback: answeredPr.feedback }, { ...answeredPr, files: [f('README.md')] }]) {
+    assert.equal(g.reviewState(pr), 'answered');
+    expectState(pr, 'failure', UNRESOLVED);
+    expectState({ ...pr, ...approvedNow }, 'failure', UNRESOLVED);
+  }
+  assert.equal(g.classify({ ...agentPr }).risk, 'agent');
+  assert.equal(g.classify({ ...answeredPr, files: [f('README.md')] }).risk, 'low');
+});
+
+test('answered: one finding without a reply fails', () => {
+  const fb = [codex('H', true), ...sixAnswered, cFinding(7)];
+  expectState({ ...base, feedback: fb }, 'failure', UNRESOLVED);
+  // any priority counts: an unanswered P2 or P3 thread, or one with no badge, keeps it red
+  for (const p of ['P2', 'P3']) expectState({ ...base, feedback: [...fb.slice(0, -1), cFinding(7, 'C7', undefined, p)] }, 'failure', UNRESOLVED);
+  expectState({ ...base, feedback: [...fb.slice(0, -1), { ...cFinding(7), body: 'Consider renaming this.' }] }, 'failure', UNRESOLVED);
+});
+
+test('answered: a reply only from an account that is not the owner fails', () => {
+  for (const author of ['someone', 'claude[bot]', CODEX_BOT, 'github-actions[bot]']) {
+    const fb = [codex('H', true), ...sixAnswered.filter((x) => x.id !== 1001), cReply(1, { author })];
+    expectState({ ...base, feedback: fb }, 'failure', UNRESOLVED);
+  }
+  // no owner known: never answered
+  expectState({ ...answeredPr, owner: undefined }, 'failure', UNRESOLVED);
+});
+
+test('answered: an owner comment posted before the finding, or outside its thread, fails', () => {
+  const without1 = sixAnswered.filter((x) => x.id !== 1001);
+  // a standalone owner line comment created before the finding (not in its thread)
+  const before = { author: OWNER, id: 900, commitId: 'H', originalCommitId: 'C0', createdAt: '2026-11-06T08:00:00Z', body: 'Fixed.' };
+  expectState({ ...base, feedback: [codex('H', true), ...without1, before] }, 'failure', UNRESOLVED);
+  // a reply in the thread whose time is before the finding
+  expectState({ ...base, feedback: [codex('H', true), ...without1, cReply(1, { at: '2026-11-06T08:59:00Z' })] }, 'failure', UNRESOLVED);
+  // a reply with no time
+  expectState({ ...base, feedback: [codex('H', true), ...without1, { ...cReply(1), createdAt: undefined }] }, 'failure', UNRESOLVED);
+});
+
+test('answered: an owner reply in a different thread does not answer this one', () => {
+  const fb = [codex('H', true), cFinding(1), cFinding(2), cReply(1), cReply(1, { id: 2001 })];
+  expectState({ ...base, feedback: fb }, 'failure', UNRESOLVED);
+  // a reply to a comment that is not in the list (unknown parent) answers nothing
+  expectState({ ...base, feedback: [codex('H', true), cFinding(1), cReply(999)] }, 'failure', UNRESOLVED);
+});
+
+test('answered: a Codex finding raised on the head commit fails, even with a reply', () => {
+  expectState({ ...base, feedback: [codex('H', true), ...sixAnswered, cFinding(7, 'H'), cReply(7)] }, 'failure', UNRESOLVED);
+  // Codex repeating itself in an old thread on the head commit blocks too
+  const repeat = { ...cReply(1, { author: CODEX_BOT, id: 3001, commit: 'H', at: '2026-11-06T09:45:00Z' }), body: 'Still an issue.' };
+  expectState({ ...base, feedback: [codex('H', true), ...sixAnswered, repeat, cReply(1, { id: 4001, at: '2026-11-06T09:50:00Z' })] }, 'failure', UNRESOLVED);
+  // a Codex comment after the owner's reply needs a new owner reply
+  const later = { ...repeat, originalCommitId: 'C9' };
+  expectState({ ...base, feedback: [codex('H', true), ...sixAnswered, later] }, 'failure', UNRESOLVED);
+  expectState({ ...base, feedback: [codex('H', true), ...sixAnswered, later, cReply(1, { id: 4001, at: '2026-11-06T09:50:00Z' })] }, 'pending', `${ANSWERED_WAIT} — ${NO_TIER}`);
+  // a Codex finding with no original commit fails closed
+  expectState({ ...base, feedback: [codex('H', true), { ...cFinding(1), originalCommitId: undefined }, cReply(1)] }, 'failure', UNRESOLVED);
+  // a Codex review body on the head commit that carries a finding badge
+  const review = { author: CODEX_BOT, commitId: 'H', body: '![P2 Badge](https://img.shields.io/badge/P2-yellow) General finding' };
+  expectState({ ...base, feedback: [codex('H', true), ...sixAnswered, review] }, 'failure', UNRESOLVED);
+  expectState({ ...base, feedback: [codex('H', true), ...sixAnswered, { ...review, commitId: 'C1' }] }, 'pending', `${ANSWERED_WAIT} — ${NO_TIER}`);
+});
+
+test('answered: a finding thread whose first comment is not by Codex does not count', () => {
+  // an owner-account "finding" answered by the owner: no Codex finding threads at all
+  const fake = { ...cFinding(1), author: OWNER };
+  expectState({ ...base, feedback: [codex('H', true), fake, cReply(1)] }, 'failure', UNRESOLVED);
+  // a thread started by someone else in which Codex comments keeps the gate red
+  const codexIn = { ...cReply(1, { author: CODEX_BOT, id: 3001, at: '2026-11-06T09:10:00Z' }), body: 'P1 Badge still wrong' };
+  expectState({ ...base, feedback: [codex('H', true), ...sixAnswered, { ...cFinding(50), author: 'someone' }, { ...codexIn, inReplyToId: 50 }, cReply(50)] }, 'failure', UNRESOLVED);
+});
+
+test('answered: Codex state for head not completed stays pending (or failure) as today', () => {
+  expectState({ ...base, feedback: [codex('H', null, 'running'), ...sixAnswered] }, 'pending', 'Waiting for a completed review of this commit');
+  // a not-completed state that already reports unresolved findings blocks, as today
+  expectState({ ...base, feedback: [codex('H', true, 'running'), ...sixAnswered] }, 'failure', UNRESOLVED);
+  // a completed blocking state next to a running one for the same head still blocks
+  expectState({ ...base, feedback: [codex('H', true), codex('H', null, 'running'), ...sixAnswered] }, 'failure', UNRESOLVED);
+});
+
+test('answered: Codex state for an older commit only is no review of the head', () => {
+  expectState({ ...base, feedback: [codex('OLD', true), ...sixAnswered] }, 'pending', 'Waiting for a completed review of this commit');
+  // an older state next to the head's is ignored
+  assert.equal(g.reviewState({ ...base, feedback: [codex('OLD', true), codex('H', true), ...sixAnswered] }), 'answered');
+});
+
+test('answered: review:blocking with all findings answered fails', () => {
+  expectState({ ...answeredPr, labels: ['review:blocking'] }, 'failure', UNRESOLVED);
+  expectState({ ...answeredPr, labels: ['review:blocking', 'human-approved'], labelEvents: [label('2026-11-06T10:05:00Z')] }, 'failure', UNRESOLVED);
+});
+
+test('answered: another reviewer bot\'s P0 on the head commit, or its blocking verdict, fails', () => {
+  const p0 = { author: 'claude[bot]', commitId: 'H', body: '![P0 Badge](https://img.shields.io/badge/P0-red) broken' };
+  expectState({ ...answeredPr, feedback: [...answeredPr.feedback, p0] }, 'failure', UNRESOLVED);
+  expectState({ ...answeredPr, ...approvedNow, feedback: [...answeredPr.feedback, p0] }, 'failure', UNRESOLVED);
+  expectState({ ...answeredPr, feedback: [...answeredPr.feedback, claudeVerdict('H', 'blocking')] }, 'failure', UNRESOLVED);
+  // a Claude verdict for the head that is neither clear nor blocking keeps it blocked too
+  expectState({ ...answeredPr, feedback: [...answeredPr.feedback, claudeVerdict('H', 'maybe')] }, 'failure', UNRESOLVED);
+  // a clear Claude verdict does not stop the answered state
+  assert.equal(g.reviewState({ ...answeredPr, feedback: [...answeredPr.feedback, claudeVerdict('H')] }), 'answered');
+});
+
+test('answered: Codex state with unresolved findings and no finding threads at all fails', () => {
+  expectState({ ...base, feedback: [codex('H', true)] }, 'failure', UNRESOLVED);
+  expectState({ ...base, feedback: [codex('H', true), { author: OWNER, body: 'All fixed.' }] }, 'failure', UNRESOLVED);
+});
+
+test('answered: on a codex/ PR it applies to the primary review only; the second review is unchanged', () => {
+  const cpr = { ...answeredPr, headRef: 'codex/fix-x' };
+  assert.equal(g.classify(cpr).risk, 'normal');
+  expectState(cpr, 'pending', 'Codex PR: waiting for the Claude review of this commit');
+  expectState({ ...cpr, feedback: [...cpr.feedback, verdictBy('claude[bot]', 'H', 'clear')] }, 'pending', `${ANSWERED_WAIT} — ${NO_TIER}`);
+  expectState({ ...cpr, feedback: [...cpr.feedback, verdictBy(OWNER, 'H', 'blocking')] }, 'failure', 'Claude review of this Codex PR found P0/P1 issues');
+  const line = { author: 'claude[bot]', commitId: 'H', body: '![P1 Badge](https://img.shields.io/badge/P1-orange) problem' };
+  expectState({ ...cpr, ...approvedNow, feedback: [...cpr.feedback, line] }, 'failure', 'Claude review of this Codex PR found P0/P1 issues');
+  // the owner's approval stands in for a missing Claude review, as today
+  expectState({ ...cpr, ...approvedNow }, 'success', ANSWERED_OK);
+  // a codex/ PR in the agent-safe tier fails as today
+  expectState({ ...codexPr, feedback: [...answeredPr.feedback, verdictBy('claude[bot]', 'H', 'clear')] }, 'failure', UNRESOLVED);
+});
+
+test('answered: review:override behaves as today', () => {
+  const ov = { event: 'labeled', label: 'review:override', actor: OWNER, viaApp: false, at: '2026-11-06T10:05:00Z' };
+  const low = { ...answeredPr, files: [f('README.md')], labels: ['review:override'], labelEvents: [ov] };
+  expectState(low, 'success', 'risk:low; review findings overridden by owner');
+  expectState({ ...answeredPr, labels: ['review:override'], labelEvents: [ov] }, 'pending', `risk:normal: waiting for human-approved — ${NO_TIER}`);
+  expectState({ ...answeredPr, labels: ['review:override', 'human-approved'], labelEvents: [ov, label('2026-11-06T10:06:00Z')] }, 'success', 'human-approved; review findings overridden by owner');
+  expectState({ ...low, labelEvents: [{ ...ov, viaApp: true }] }, 'failure', UNRESOLVED);
+});
+
+test('answered: a draft PR stays a draft', () => {
+  expectState({ ...answeredPr, draft: true }, 'pending', 'Draft PR');
+});

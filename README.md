@@ -2,11 +2,21 @@
 
 A merge gate for repositories where AI coding agents open pull requests. It sets one required commit status, `review-gate`, that passes only when:
 
-1. **a reviewer bot has reviewed the current head commit** with no unresolved findings from Codex, and no unresolved P0/P1 finding from any other reviewer (Codex's review summary, or a structured verdict from a Claude reviewer), and
+1. **a reviewer bot has reviewed the current head commit** with no unresolved findings from Codex, and no unresolved P0/P1 finding from any other reviewer (Codex's review summary, or a structured verdict from a Claude reviewer); for `risk:normal` PRs, Codex findings that are all answered also count once the owner approves (see below), and
 2. one of:
    - **the change is low risk** (`risk:low`: docs, added tests, Dependabot patch bumps, deletion-only dead-code removal);
    - **the change is agent-safe** (`risk:agent`, opt-in per repo, see below);
    - **the repository owner has approved this exact commit** with the `human-approved` label (`risk:normal`).
+
+## Answered findings wait for `human-approved`
+
+Codex reports `has_unresolved_findings: true` until a person resolves each of its threads, even when every finding was fixed and answered. The gate therefore has a review state `answered`, used in place of a block only when all of these hold:
+
+- the only reason to block is Codex's own state for the head commit, and that state is completed (`review:blocking`, a blocking or unfinished verdict from another reviewer, or another reviewer bot's P0/P1 line finding on the head commit still blocks);
+- Codex has at least one finding thread, and every thread Codex has commented in (any priority, P0 to P3 or none) starts with a Codex comment and has a later comment from the repository owner's account;
+- no Codex comment in those threads was first made on the head commit, and no Codex review of the head commit carries a finding badge. A finding Codex raises or repeats on the newest commit always blocks, as does a Codex comment after the owner's last reply.
+
+For a `risk:normal` PR, `answered` reads "risk:normal: waiting for human-approved — reviewer findings answered, not resolved", and the owner's `human-approved` on that commit passes it ("human-approved; reviewer findings answered, not resolved") without resolving each thread. Agents comment with the owner's identity, so a reply proves nothing on its own: `answered` **never applies to `risk:low` or `risk:agent`**, which fail with the unresolved-findings text exactly as before, and it never passes a PR without the owner's approval. `review:override` works as before, and on `codex/` PRs it covers Codex's review only (the Claude second review is unchanged). The gate never resolves or writes to review threads. Thread replies don't trigger the gate themselves; it recomputes on the next review result or label change, such as adding `human-approved`.
 
 ## Codex-written PRs need a second review
 
