@@ -48,6 +48,7 @@ const isTest = (f) => TEST_PATH.some((r) => r.test(f));
 const isDoc = (f) => DOC_PATH.some((r) => r.test(f));
 const isDependencyFile = (f) => DEPENDENCY_FILES.some((r) => r.test(f));
 const isPackageConfig = (f) => PACKAGE_CONFIG_FILES.some((r) => r.test(f));
+const isPlainMarkdown = (f) => /\.md$/.test(f) && !isTest(f);
 
 function classifyFile(file) {
   const { filename, status, patch = '' } = file;
@@ -145,8 +146,14 @@ function agentSafe({ headRef, files, policy, issue }) {
     // Language-agnostic backstop: whatever the file type, a removed test or
     // assertion line, or an added skip, is never agent-safe (inline tests such as
     // Rust #[test] or a test file this list doesn't recognise are still caught).
-    if (REMOVED_TEST_LINE.test(f.patch || '')) return { ok: false, why: `test or assertion line removed in ${f.filename}` };
-    if (ADDED_SKIP_LINE.test(f.patch || '')) return { ok: false, why: `test skipped or narrowed in ${f.filename}` };
+    // Markdown outside test paths is exempt, by the `.md` ending only (not isDoc),
+    // and for a rename only when both names are such Markdown files. This assumes
+    // the repo runs no tests from Markdown (doctests); a repo that does should not
+    // rely on the agent-safe tier for Markdown changes.
+    if (!pathsOf(f).every(isPlainMarkdown)) {
+      if (REMOVED_TEST_LINE.test(f.patch || '')) return { ok: false, why: `test or assertion line removed in ${f.filename}` };
+      if (ADDED_SKIP_LINE.test(f.patch || '')) return { ok: false, why: `test skipped or narrowed in ${f.filename}` };
+    }
     if (pathsOf(f).some(isTest)) {
       const c = classifyFile({ ...f, filename: pathsOf(f).find(isTest) });
       if (!c.low) return { ok: false, why: c.why };
