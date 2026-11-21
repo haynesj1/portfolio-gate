@@ -30,7 +30,7 @@ Off unless the repo's `.ops.yml` **on the default branch** says `agent_safe: tru
 
 - its branch is `claude/…` or `codex/…`, and it implements a linked issue (`claude/<n>`, `codex/<n>`, or `Closes #n`) that is open, queued (`ready` or `in-progress`) and **not** labelled `pivotal`;
 - it touches no protected path, no dependency manifest, nothing under `sensitive_paths` or `pivotal_paths` from `.ops.yml`, and deletes no file (a rename is checked on both its old and new path);
-- it deletes or skips no test or assertion (lines removed from Markdown files outside test folders are not counted; a repo that runs tests from Markdown, such as doctests, should not rely on this tier for Markdown changes);
+- the number of tests or assertions does not fall, and no test is skipped. Test-declaring and asserting lines are counted separately, removed against added, across the whole PR, so an edited, renamed or moved test is fine; a deleted test file, or one moved out of test discovery, still fails. Added lines count in full only in files a runner finds by name (such as `*.test.ts`, `test_*.py`, `*_test.go`), and not when they are comments; in any other file they can only offset removed lines of that same file. Lines in Markdown files outside test folders are not counted at all (a repo that runs tests from Markdown, such as doctests, should not rely on this tier for Markdown changes);
 - it changes at most `agent_max_lines` lines (default 400);
 - a reviewer bot has cleared the head commit, as for every tier. CI checks are required separately by the repo's ruleset.
 

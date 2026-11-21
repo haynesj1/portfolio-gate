@@ -369,13 +369,106 @@ test('the removed-test backstop skips Markdown files outside test paths', () => 
   assert.equal(run(ren('docs/a.md', 'docs/b.md', '-  "context": {')).risk, 'agent');
   // the backstop still applies to everything else
   const kept = (file, why) => { const r = run(file); assert.equal(r.risk, 'normal'); assert.equal(r.agentWhy, why); };
-  kept(f('src/a.ts', '-  "context": {'), 'test or assertion line removed in src/a.ts');
-  kept(f('docs/example.rs', '-  "context": {'), 'test or assertion line removed in docs/example.rs');
-  kept(ren('src/a.rs', 'notes.md', '-#[test]'), 'test or assertion line removed in notes.md');
-  kept(ren('notes.md', 'src/a.rs', '-#[test]'), 'test or assertion line removed in src/a.rs');
-  kept(f('notes.MD', '-#[test]'), 'test or assertion line removed in notes.MD');
-  kept(f('tests/README.md', "-it('works', () => {})"), 'test or assertion line removed in tests/README.md');
+  // (issue #6: the reason is now the PR-wide count, not the file name)
+  const fell = 'tests fell from the diff: 1 removed, 0 added';
+  kept(f('src/a.ts', '-  "context": {'), fell);
+  kept(f('docs/example.rs', '-  "context": {'), fell);
+  kept(ren('src/a.rs', 'notes.md', '-#[test]'), fell);
+  kept(ren('notes.md', 'src/a.rs', '-#[test]'), fell);
+  kept(f('notes.MD', '-#[test]'), fell);
+  kept(f('tests/README.md', "-it('works', () => {})"), fell);
   kept(f('docs/decisions/0009-x.md', '-  "context": {'), 'protected path docs/decisions/0009-x.md');
+});
+
+// ---- counted tests and assertions (issue #6) --------------------------------
+const run6 = (...files) => g.classify({ ...agentPr, files });
+const isAgent = (...files) => { const r = run6(...files); assert.equal(r.risk, 'agent', r.agentWhy); };
+const keptOut = (why, ...files) => { const r = run6(...files); assert.equal(r.risk, 'normal'); assert.equal(r.agentWhy, why); };
+const ren6 = (from, to, patch = '+x') => f(to, patch, { status: 'renamed', previous_filename: from });
+const realTest = "-it('doubles', () => {\n-  expect(double(2)).toBe(4);\n-});";
+
+test('counting: each kind is counted on its own, and a removed line is counted wherever REMOVED_TEST_LINE matches', () => {
+  assert.deepEqual(g.countTestLines("-it('a', () => {\n-  expect(a).toBe(1);\n+it('b', () => expect(b).toBe(2));\n+const x = 1;"),
+    { tests: { removed: 1, added: 1 }, assertions: { removed: 1, added: 1 } });
+  const lines = ["it('x'", 'test("x"', "describe('x'", "context 'x'", 'def test_x():', '@Test fun x()', 'func TestX(t *testing.T) {', '#[test]', '#[tokio::test]',
+    't.Run("x", f)', 'expect(x)', 'expect { x }', 'assert x == 1', 'assert_eq!(a, b)', 't.Errorf("x")', 't.Fatal(err)', 'XCTAssertEqual(a, b)', 'require.NoError(t, err)',
+    '"context": {', 'if (/x/.test(s))', 'const y = 1;', '--x'];
+  for (const l of lines) {
+    const n = g.countTestLines(`-${l}`);
+    assert.equal(n.tests.removed + n.assertions.removed > 0, g.REMOVED_TEST_LINE.test(`-${l}`), l);
+  }
+  // CRLF patches split the same way
+  assert.equal(g.countTestLines("-it('a')\r\n-it('b')\r\n").tests.removed, 2);
+});
+
+test('counting: an edited assertion, a renamed test, or a test moved between files is risk:agent', () => {
+  isAgent(f('src/a.test.ts', '-  expect(x).toBe(1);\n+  expect(x).toBe(2);'));
+  isAgent(f('src/a.test.ts', "-it('adds one', () => {\n+it('adds one to a number', () => {"));
+  isAgent(f('tests/test_a.py', '-def test_old_name():\n+def test_new_name():'));
+  isAgent(f('src/a.test.ts', realTest), f('src/b.test.ts', "+it('doubles', () => {\n+  expect(double(2)).toBe(4);\n+});"));
+  // the PR that prompted the issue: 1 test and 1 assertion removed, 5 and 10 added
+  const added = Array.from({ length: 5 }, (_, i) => `+it('case ${i}', () => {\n+  expect(a${i}).toBe(1);\n+  expect(b${i}).toBe(2);\n+});`).join('\n');
+  isAgent(f('src/a.test.ts', `${realTest}\n${added}`));
+  // an edited inline Rust test balances within its own file
+  isAgent(f('src/lib.rs', '-        assert_eq!(add(1, 1), 2);\n+        assert_eq!(add(2, 2), 4);'));
+});
+
+test('counting: a removed test, fewer assertions, a skip, a deleted or moved-out test file, or a removed inline #[test] is not risk:agent', () => {
+  keptOut('tests fell from the diff: 1 removed, 0 added', f('src/a.test.ts', realTest));
+  keptOut('assertions fell from the diff: 2 removed, 1 added', f('src/a.test.ts', '-  expect(a).toBe(1);\n-  expect(b).toBe(2);\n+  expect([a, b]).toEqual([1, 2]);'));
+  keptOut('test skipped or narrowed in src/a.test.ts', f('src/a.test.ts', "-it('x', () => {\n+it.skip('x', () => {"));
+  keptOut('test skipped or narrowed in src/a.test.ts', f('src/a.test.ts', "-it('x', () => {\n+xit('x', () => {"));
+  keptOut('test file deleted: src/a.test.ts', f('src/a.test.ts', realTest, { status: 'removed', additions: 0 }));
+  keptOut('test file moved out of tests: tests/a.test.ts', ren6('tests/a.test.ts', 'src/a.ts'));
+  // still a test path, but no longer a name the runner finds (with a code change, so not risk:low)
+  keptOut('test file moved out of tests: tests/a.test.ts', f('src/app.ts'), ren6('tests/a.test.ts', 'tests/a.ts'));
+  keptOut('tests fell from the diff: 1 removed, 0 added', f('src/lib.rs', '-#[test]\n-fn adds() {\n-    assert_eq!(add(1, 1), 2);\n-}'));
+  // a test moved into a file that is deleted elsewhere in the PR is still a deleted file
+  keptOut('test file deleted: src/b.test.ts', f('src/a.test.ts', "+it('x', () => {})"), f('src/b.test.ts', "-it('x', () => {})", { status: 'removed' }));
+});
+
+test('counting: gaming the count', () => {
+  const fell = 'tests fell from the diff: 1 removed, 0 added';
+  // a removed real test offset by an added trivial assertion: the test count still falls
+  keptOut(fell, f('src/a.test.ts', `${realTest}\n+  expect(true).toBe(true);`));
+  // "tests" added in Markdown, in a file no runner executes, or in a fixture don't count
+  keptOut(fell, f('src/a.test.ts', realTest), f('docs/notes.md', "+it('doubles', () => {\n+  expect(double(2)).toBe(4);"));
+  keptOut(fell, f('src/a.test.ts', realTest), f('src/unused.ts', "+it('doubles', () => {\n+  expect(double(2)).toBe(4);"));
+  keptOut(fell, f('src/a.test.ts', realTest), f('tests/notes.md', "+it('doubles', () => {\n+  expect(double(2)).toBe(4);"));
+  keptOut(fell, f('src/a.test.ts', realTest), f('testdata/sample.test.js', "+it('doubles', () => {\n+  expect(double(2)).toBe(4);"));
+  // ordinary code that matches the patterns never offsets a removed test
+  keptOut(fell, f('src/a.test.ts', realTest), f('src/a.ts', '+if (/x/.test(s)) assert(ok);\n+  expect(y);'));
+  keptOut(fell, f('src/lib.rs', '-#[test]'), f('src/lib.rs', '+    let v = read().context("read failed")?;'));
+  keptOut(fell, f('src/a.test.ts', `${realTest}\n+  expect(/x/.test(s)).toBe(true);`));
+  // one kind never offsets the other
+  keptOut('tests fell from the diff: 2 removed, 0 added', f('src/a.test.ts', "-it('a', () => {})\n-it('b', () => {})\n+  expect(a).toBe(1);\n+  expect(b).toBe(1);"));
+  keptOut('assertions fell from the diff: 1 removed, 0 added', f('src/a.test.ts', "-  expect(a).toBe(1);\n+it('a', () => {})"));
+  // a removed describe block counts its own line and every test in it
+  const block = "-describe('suite', () => {\n-  it('a', () => {})\n-  it('b', () => {})\n-});";
+  keptOut('tests fell from the diff: 3 removed, 2 added', f('src/a.test.ts', `${block}\n+it('c', () => {})\n+it('d', () => {})`));
+  // comment lines don't count when added (they still count when removed)
+  keptOut(fell, f('src/a.test.ts', "-it('a', () => {})\n+// it('a', () => {})"));
+  keptOut('assertions fell from the diff: 1 removed, 0 added', f('tests/test_a.py', '-    assert x == 1\n+    # assert x == 1'));
+  keptOut('tests fell from the diff: 1 removed, 0 added', f('src/a.test.ts', "-// it('a', () => {})"));
+  // a rename cannot change which side counts
+  keptOut(fell, ren6('src/a.rs', 'notes.md', '-#[test]'), f('src/b.test.ts', '+x'));
+  keptOut('test file moved out of tests: src/b.test.ts', f('src/a.test.ts', realTest), ren6('src/b.test.ts', 'docs/b.md', "+it('doubles', () => {})"));
+  keptOut(fell, f('src/a.test.ts', realTest), ren6('docs/b.md', 'src/b.md', "+it('doubles', () => {})"));
+  // a file renamed into a runnable test name counts in full
+  isAgent(f('src/a.test.ts', realTest), ren6('docs/b.md', 'src/b.test.ts', "+it('doubles', () => {\n+  expect(double(2)).toBe(4);"));
+});
+
+test('counting: what the count cannot tell (pinned so a change is deliberate)', () => {
+  // a real test replaced by a trivial one in a runnable test file
+  isAgent(f('src/a.test.ts', `${realTest}\n+it('works', () => {\n+  expect(true).toBe(true);\n+});`));
+  // two removed tests offset by an added (empty) describe and one test
+  isAgent(f('src/a.test.ts', "-it('a', () => {})\n-it('b', () => {})\n+describe('suite', () => {\n+  it('c', () => {})\n+});"));
+});
+
+test('counting: classifyFile and risk:low are unchanged by the count', () => {
+  assert.equal(g.classify({ ...base, files: [f('src/a.test.ts', '-  expect(x).toBe(1);\n+  expect(x).toBe(2);')] }).risk, 'normal');
+  assert.equal(g.classifyFile(f('src/a.test.ts', "-it('a', () => {})\n+it('b', () => {})")).why, 'test or assertion removed in src/a.test.ts');
+  assert.equal(g.classify({ ...base, files: [f('src/a.test.ts', "+it('b', () => {})")] }).risk, 'low');
 });
 
 // ---- real app .ops.yml files (copied into gate/fixtures) -------------------
@@ -408,7 +501,7 @@ test('description: each agentSafe rule names itself after the unchanged fixed te
     [{ files: [f('src/auth/login.ts')] }, 'sensitive path src/auth/login.ts'],
     [{ files: [f('src/routes/reveal/x.ts')] }, 'pivotal path src/routes/reveal/x.ts'],
     [{ files: [f('src/old.ts', '', { status: 'removed' })] }, 'file deleted: src/old.ts'],
-    [{ files: [f('src/a.test.ts', "-it('works', () => {})")] }, 'test or assertion line removed in src/a.test.ts'],
+    [{ files: [f('src/a.test.ts', "-it('works', () => {})")] }, 'tests fell from the diff: 1 removed, 0 added'],
     [{ files: [f('src/a.ts', '+x', { additions: 250, deletions: 51 })] }, '301 lines changed (cap 300)'],
   ];
   for (const [over, why] of cases) {

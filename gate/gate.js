@@ -12,10 +12,13 @@ const PROTECTED = [
   /^\.github\//, /^AGENTS\.md$/, /^CLAUDE\.md$/, /^\.ops\.yml$/, /^\.claude\//,
   /^specs\//, /^docs\/vision\.md$/, /^docs\/decisions\//,
 ];
-const TEST_PATH = [
-  /(^|\/)(tests?|__tests__|e2e|spec|specs|testdata)\//, /\.(test|spec)\.[cm]?[jt]sx?$/,
-  /(^|\/)test_[^/]*\.py$/, /_test\.(py|go|rs|exs?)$/, /_spec\.rb$/, /(^|\/)src\/(test|androidTest)\//,
+// Files named as tests: a test runner finds them by their name.
+const TEST_FILE_NAME = [
+  /\.(test|spec)\.[cm]?[jt]sx?$/, /(^|\/)test_[^/]*\.py$/, /_test\.(py|go|rs|exs?)$/, /_spec\.rb$/,
   /(Test|Tests|Spec)\.(kt|kts|java|swift|scala|cs)$/,
+];
+const TEST_PATH = [
+  /(^|\/)(tests?|__tests__|e2e|spec|specs|testdata)\//, /(^|\/)src\/(test|androidTest)\//, ...TEST_FILE_NAME,
 ];
 const DOC_PATH = [/\.md$/, /^docs\//];
 const DEPENDENCY_FILES = [
@@ -32,9 +35,17 @@ const PACKAGE_CONFIG_FILES = [
   /(^|\/)\.nvmrc$/, /(^|\/)\.node-version$/, /(^|\/)\.python-version$/, /(^|\/)\.tool-versions$/,
   /(^|\/)pip\.conf$/, /(^|\/)gradle\.properties$/, /(^|\/)gradle\/wrapper\//,
 ];
-// A removed line in a test file that looks like a test or an assertion.
-// Covers JS/TS, Python, Kotlin/Java, Go, Rust, Ruby, Swift and Elixir test syntax.
-const REMOVED_TEST_LINE = /^-(?!--).*(\b(it|test|describe|context)\s*[('"]|def test_|@Test\b|\bexpect\s*[({]|\bassert|\bfunc Test\w*\(|#\[(tokio::)?test\]|\bt\.(Error|Errorf|Fatal|Fatalf|Run)\(|\bXCTAssert|\brequire\.\w+\()/m;
+// A line that declares a test, and a line that asserts. Covers JS/TS, Python,
+// Kotlin/Java, Go, Rust, Ruby, Swift and Elixir test syntax.
+const TEST_DECL = /\b(it|test|describe|context)\s*[('"]|def test_|@Test\b|\bfunc Test\w*\(|#\[(tokio::)?test\]|\bt\.Run\(/;
+const ASSERTION = /\bexpect\s*[({]|\bassert|\bt\.(Error|Errorf|Fatal|Fatalf)\(|\bXCTAssert|\brequire\.\w+\(/;
+// A removed line that looks like a test or an assertion (either kind above).
+const REMOVED_TEST_LINE = new RegExp('^-(?!--).*(' + TEST_DECL.source + '|' + ASSERTION.source + ')', 'm');
+// Added lines must be real to offset a removed one, so the added side is
+// stricter: comment lines don't count, and neither does `it`, `test`,
+// `describe` or `context` called as a method (a regex `.test(`, Rust `.context(`).
+const ADDED_TEST_DECL = new RegExp('(?<!\\.\\s*)(?:' + TEST_DECL.source + ')');
+const COMMENT_LINE = /^\s*(\/\/|\/\*|\*|#(?!\[)|--|<!--)/;
 // An added line that disables or narrows tests.
 const ADDED_SKIP_LINE = /^\+(?!\+\+).*(\.(skip|only|todo|fixme)\s*\(|\bx(it|describe|test)\s*\(|@pytest\.mark\.(skip|xfail)|pytest\.skip\(|@unittest\.skip|@Ignore\b|@Disabled\b|\bt\.Skip(Now|f)?\(|#\[ignore\]|@tag :skip|\bpending\b\s*(\(|$))/m;
 const BLOCKING_FINDING = /(badge\/P[01]-|\bP[01]\s*Badge)/i;
@@ -49,6 +60,8 @@ const isDoc = (f) => DOC_PATH.some((r) => r.test(f));
 const isDependencyFile = (f) => DEPENDENCY_FILES.some((r) => r.test(f));
 const isPackageConfig = (f) => PACKAGE_CONFIG_FILES.some((r) => r.test(f));
 const isPlainMarkdown = (f) => /\.md$/.test(f) && !isTest(f);
+// A file a test runner executes: named as a test, and not a fixture.
+const isTestFile = (f) => TEST_FILE_NAME.some((r) => r.test(f)) && !/(^|\/)(testdata|fixtures?)\//.test(f);
 
 function classifyFile(file) {
   const { filename, status, patch = '' } = file;
@@ -67,7 +80,8 @@ function classifyFile(file) {
 // `.ops.yml` on the default branch (a protected path, so agents can't change
 // it in a PR). A PR qualifies only if it is an agent PR for a linked, queued,
 // non-pivotal issue, touches no protected, dependency, sensitive or pivotal
-// path, doesn't delete or skip tests, and stays under the size cap.
+// path, doesn't lower the number of tests or assertions or skip a test, and
+// stays under the size cap.
 // Only the keys below are read, so a tiny parser is enough (no YAML library).
 function parseOpsPolicy(text) {
   // Allowlist parser: every line must be blank, a comment, a plain top-level
@@ -125,6 +139,43 @@ function linkedIssue(headRef, body) {
   return c ? Number(c[1]) : null;
 }
 
+// Counts, in one file's patch, the removed and added lines that declare a test
+// and those that assert. A line can be both. Every removed line that
+// REMOVED_TEST_LINE matches is counted; added lines use the stricter rules above.
+function countTestLines(patch) {
+  const n = { tests: { removed: 0, added: 0 }, assertions: { removed: 0, added: 0 } };
+  // Split on every line terminator, as `^` with the m flag does.
+  for (const line of String(patch || '').split(/\r\n?|[\n\u2028\u2029]/)) {
+    if (/^-(?!--)/.test(line)) {
+      if (TEST_DECL.test(line)) n.tests.removed++;
+      if (ASSERTION.test(line)) n.assertions.removed++;
+    } else if (/^\+(?!\+\+)/.test(line) && !COMMENT_LINE.test(line.slice(1))) {
+      if (ADDED_TEST_DECL.test(line)) n.tests.added++;
+      if (ASSERTION.test(line)) n.assertions.added++;
+    }
+  }
+  return n;
+}
+
+// Totals across a PR's files (renames included). Markdown outside test paths
+// (both names, for a rename) is counted on neither side. Added lines count in
+// full only in a file a runner executes (isTestFile); in any other file they
+// can offset removed lines of the same file (an edited inline test) but no more,
+// so lines pasted into a file nothing runs never stand in for a removed test.
+function countPrTestLines(files) {
+  const total = { tests: { removed: 0, added: 0 }, assertions: { removed: 0, added: 0 } };
+  for (const f of files) {
+    if (pathsOf(f).every(isPlainMarkdown)) continue;
+    const n = countTestLines(f.patch);
+    const runs = isTestFile(f.filename);
+    for (const kind of ['tests', 'assertions']) {
+      total[kind].removed += n[kind].removed;
+      total[kind].added += runs ? n[kind].added : Math.min(n[kind].added, n[kind].removed);
+    }
+  }
+  return total;
+}
+
 // Returns { ok, why }. `issue` is { state, labels } of the linked issue or null.
 function agentSafe({ headRef, files, policy, issue }) {
   if (!policy?.agentSafe) return { ok: false, why: 'agent-safe tier not enabled for this repo' };
@@ -140,24 +191,25 @@ function agentSafe({ headRef, files, policy, issue }) {
       if (matchesAny(name, policy.sensitive)) return { ok: false, why: `sensitive path ${name}` };
       if (matchesAny(name, policy.pivotal)) return { ok: false, why: `pivotal path ${name}` };
     }
-    // A test moved out of test discovery is a removed test, and the
-    // removal/skip checks apply when either side of a rename is a test.
-    if (f.previous_filename && isTest(f.previous_filename) && !isTest(f.filename)) return { ok: false, why: `test file moved out of tests: ${f.previous_filename}` };
-    // Language-agnostic backstop: whatever the file type, a removed test or
-    // assertion line, or an added skip, is never agent-safe (inline tests such as
-    // Rust #[test] or a test file this list doesn't recognise are still caught).
-    // Markdown outside test paths is exempt, by the `.md` ending only (not isDoc),
-    // and for a rename only when both names are such Markdown files. This assumes
-    // the repo runs no tests from Markdown (doctests); a repo that does should not
-    // rely on the agent-safe tier for Markdown changes.
-    if (!pathsOf(f).every(isPlainMarkdown)) {
-      if (REMOVED_TEST_LINE.test(f.patch || '')) return { ok: false, why: `test or assertion line removed in ${f.filename}` };
-      if (ADDED_SKIP_LINE.test(f.patch || '')) return { ok: false, why: `test skipped or narrowed in ${f.filename}` };
-    }
-    if (pathsOf(f).some(isTest)) {
-      const c = classifyFile({ ...f, filename: pathsOf(f).find(isTest) });
-      if (!c.low) return { ok: false, why: c.why };
-    } else if (f.status === 'removed') return { ok: false, why: `file deleted: ${f.filename}` };
+    // A test moved out of test discovery is a removed test: out of the test
+    // paths, or from a name a runner finds to one it doesn't.
+    const prev = f.previous_filename;
+    if (prev && ((isTest(prev) && !isTest(f.filename)) || (isTestFile(prev) && !isTestFile(f.filename)))) return { ok: false, why: `test file moved out of tests: ${prev}` };
+    if (f.status === 'removed') return { ok: false, why: pathsOf(f).some(isTest) ? `test file deleted: ${f.filename}` : `file deleted: ${f.filename}` };
+    // Language-agnostic: whatever the file type, an added skip is never
+    // agent-safe. Markdown outside test paths is exempt, by the `.md` ending only
+    // (not isDoc), and for a rename only when both names are such Markdown files.
+    // This assumes the repo runs no tests from Markdown (doctests); a repo that
+    // does should not rely on the agent-safe tier for Markdown changes.
+    if (!pathsOf(f).every(isPlainMarkdown) && ADDED_SKIP_LINE.test(f.patch || '')) return { ok: false, why: `test skipped or narrowed in ${f.filename}` };
+  }
+  // An edited test is not a deleted one: the PR fails only when the number of
+  // test or assertion lines falls across all its files (countPrTestLines). Inline
+  // tests such as Rust #[test], and test files TEST_PATH doesn't recognise, count.
+  const counts = countPrTestLines(files);
+  for (const kind of ['tests', 'assertions']) {
+    const { removed, added } = counts[kind];
+    if (removed > added) return { ok: false, why: `${kind} fell from the diff: ${removed} removed, ${added} added` };
   }
   const lines = files.reduce((n, f) => n + (f.additions || 0) + (f.deletions || 0), 0);
   if (lines > policy.maxLines) return { ok: false, why: `${lines} lines changed (cap ${policy.maxLines})` };
@@ -407,4 +459,4 @@ function decide(input) {
   return { risk, reasons, agentWhy, review, secondReview: second, overridden, approved, state, description };
 }
 
-module.exports = { ACTIONS_BOT, codexFindingsAnswered, secondReview, pathsOf, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
+module.exports = { ACTIONS_BOT, codexFindingsAnswered, secondReview, pathsOf, countTestLines, countPrTestLines, REMOVED_TEST_LINE, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
