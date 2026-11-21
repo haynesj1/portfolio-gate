@@ -23,7 +23,7 @@ const labelled = (at, extra = {}) => ({ event: 'labeled', label: { name: 'human-
 const run = (sha, at, pr = 1, path = '.github/workflows/pr-gate.yml') => ({ head_sha: sha, created_at: at, path, pull_requests: [{ number: pr }] });
 const code = [{ filename: 'src/app.ts', status: 'modified', patch: '+x', additions: 1 }];
 
-function harness({ headSha = 'H', event = 'pull_request_target', action = 'synchronize', files = code, comments = [], timeline = [], runs = [], labels = [], headRef = 'feature', ops = null, issue = null, openPrs = [], issueEvent = null, pushRef = undefined }) {
+function harness({ headSha = 'H', event = 'pull_request_target', action = 'synchronize', files = code, comments = [], timeline = [], runs = [], labels = [], headRef = 'feature', ops = null, issue = null, openPrs = [], issueEvent = null, pushRef = undefined, reviewComments = [] }) {
   const written = []; const added = []; const seenRefs = [];
   const github = {
     paginate: async (fn, args) => fn(args),
@@ -34,7 +34,7 @@ function harness({ headSha = 'H', event = 'pull_request_target', action = 'synch
         list: async () => openPrs,
         listCommits: async () => [{ author: { login: OWNER } }],
         listReviews: async () => [],
-        listReviewComments: async () => [],
+        listReviewComments: async () => reviewComments,
       },
       issues: {
         listEventsForTimeline: async () => timeline,
@@ -339,4 +339,28 @@ test('workflow: a .ops.yml push to the default branch re-evaluates open agent PR
 test('caller: pushes of .ops.yml to the default branch trigger the gate', () => {
   const callerYml = fs.readFileSync(path.join(__dirname, '..', 'caller', 'pr-gate.yml'), 'utf8');
   assert.match(callerYml, /push:\n\s+branches: \[main, master\]\n\s+paths: \['\.ops\.yml'\]/);
+});
+
+test('workflow: answered Codex findings pass their thread fields through; the PR waits for human-approved (#14)', async () => {
+  const codexBot = { login: 'chatgpt-codex-connector[bot]' };
+  const reviewComments = [1, 2].flatMap((i) => [
+    { id: i, user: codexBot, body: '![P1 Badge](https://img.shields.io/badge/P1-orange) problem', commit_id: 'H', original_commit_id: `C${i}`, created_at: '2026-11-06T09:00:00Z' },
+    { id: 100 + i, in_reply_to_id: i, user: { login: OWNER }, body: 'Fixed in C3.', commit_id: 'H', original_commit_id: 'C3', created_at: '2026-11-06T09:30:00Z' },
+  ]);
+  const waiting = harness({ comments: [codexComment('H', true)], reviewComments, runs: [run('H', '2026-11-06T09:00:00Z')] });
+  await waiting.run();
+  assert.equal(waiting.gate().state, 'pending');
+  assert.equal(waiting.gate().description, 'risk:normal: waiting for human-approved \u2014 reviewer findings answered, not resolved \u2014 agent-safe tier not enabled for this repo');
+  const approved = harness({ labels: ['human-approved'], comments: [codexComment('H', true)], reviewComments, runs: [run('H', '2026-11-06T09:00:00Z')], timeline: [labelled('2026-11-06T10:00:00Z')] });
+  await approved.run();
+  assert.equal(approved.gate().state, 'success');
+  assert.equal(approved.gate().description, 'human-approved; reviewer findings answered, not resolved');
+  // the same threads with one reply missing stay red
+  const open = harness({ comments: [codexComment('H', true)], reviewComments: reviewComments.slice(0, 3), runs: [run('H', '2026-11-06T09:00:00Z')] });
+  await open.run();
+  assert.equal(open.gate().state, 'failure');
+  // a docs PR (risk:low) with every finding answered still fails
+  const docs = harness({ files: [{ filename: 'README.md', status: 'modified', patch: '+x', additions: 1 }], comments: [codexComment('H', true)], reviewComments });
+  await docs.run();
+  assert.equal(docs.gate().state, 'failure');
 });

@@ -79,7 +79,9 @@ __GATE_JS__
                 labelEvents,
                 feedback: [
                   ...reviews.map((r) => ({ author: r.user?.login || '', body: r.body, commitId: r.commit_id })),
-                  ...reviewComments.map((c) => ({ author: c.user?.login || '', body: c.body, commitId: c.commit_id })),
+                  // Line comments also carry their thread fields, for answered findings (gate.js).
+                  ...reviewComments.map((c) => ({ author: c.user?.login || '', body: c.body, commitId: c.commit_id,
+                    id: c.id, inReplyToId: c.in_reply_to_id, originalCommitId: c.original_commit_id, createdAt: c.created_at })),
                   ...comments.map((c) => ({ author: c.user?.login || '', body: c.body })),
                 ],
                 headSha,

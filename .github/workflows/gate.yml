@@ -239,10 +239,87 @@ jobs:
                 return 'pending';
               }
 
+              // Answered findings (issue #14). Codex's `has_unresolved_findings` stays true
+              // until a person resolves each thread, even when every finding was fixed and
+              // answered. `answered` replaces `blocking` only when Codex's own completed
+              // state for the head is the sole reason to block, and every Codex finding
+              // thread is answered by the owner's account with nothing raised on the head.
+              // The owner's account is also the agents' identity (decision 0003), so a reply
+              // proves nothing by itself: `answered` never passes a PR on its own. decide()
+              // treats it as blocking for risk:low and risk:agent, and for risk:normal it
+              // still needs human-approved on this commit.
+              //
+              // Line comments are the feedback items that carry a numeric `id` (only review
+              // comments do), with `inReplyToId`, `originalCommitId` and `createdAt`.
+              // Every thread a Codex comment appears in counts as a finding thread, whatever
+              // its priority badge (Codex's flag counts P2/P3 threads too), and must:
+              // start with a Codex comment; have no Codex comment first raised on the head
+              // commit; and have a comment by the owner's account created after the thread's
+              // last Codex comment. Anything unreadable (unknown parent, missing time or
+              // commit) fails closed, so the gate stays red.
+              const ANY_PRIORITY = /(badge\/P\d-|\bP\d\s*Badge)/i;
+              const COMPLETED = /^(completed|succeeded|success)$/i;
+              const timeOf = (t) => Date.parse(t || '');
+              function codexFindingsAnswered({ feedback, headSha, owner }) {
+                if (!owner) return false;
+                // A Codex review submitted on the head that carries a finding badge in its body.
+                if (feedback.some((x) => x.author === CODEX_BOT && !Number.isInteger(x.id) && x.commitId === headSha && ANY_PRIORITY.test(x.body || ''))) return false;
+                const lines = feedback.filter((x) => Number.isInteger(x.id));
+                const byId = new Map(lines.map((x) => [x.id, x]));
+                const rootOf = (x) => {
+                  const seen = new Set();
+                  let r = x;
+                  while (r.inReplyToId != null) {
+                    if (seen.has(r.id)) return null;
+                    seen.add(r.id);
+                    r = byId.get(r.inReplyToId);
+                    if (!r) return null;
+                  }
+                  return r;
+                };
+                const threads = new Map();
+                for (const x of lines) {
+                  const root = rootOf(x);
+                  if (!root) { if (x.author === CODEX_BOT) return false; continue; }
+                  if (!threads.has(root.id)) threads.set(root.id, { root, comments: [] });
+                  threads.get(root.id).comments.push(x);
+                }
+                let count = 0;
+                for (const { root, comments } of threads.values()) {
+                  const fromCodex = comments.filter((x) => x.author === CODEX_BOT);
+                  if (!fromCodex.length) continue;
+                  if (root.author !== CODEX_BOT) return false;
+                  if (fromCodex.some((x) => !x.originalCommitId || x.originalCommitId === headSha)) return false;
+                  const lastCodex = Math.max(...fromCodex.map((x) => timeOf(x.createdAt)));
+                  if (!Number.isFinite(lastCodex)) return false;
+                  if (!comments.some((x) => x !== root && x.author === owner && timeOf(x.createdAt) > lastCodex)) return false;
+                  count++;
+                }
+                return count > 0;
+              }
+
+              // The only verdict for the head that blocks is a completed Codex state; every
+              // other verdict for the head is clear (no pending Codex state, no other block).
+              function onlyCodexStateBlocks(primary, headSha) {
+                let codexBlocks = false;
+                for (const x of primary) {
+                  const v = verdictFor(x, headSha);
+                  if (!v) continue;
+                  if (v === 'pending') return false;
+                  const state = x.author === CODEX_BOT ? parse(CODEX_STATE, x.body)?.code_review : null;
+                  if (!state) { if (v !== 'clear') return false; continue; }
+                  if (!COMPLETED.test(state.status || '')) return false;
+                  if (v === 'blocking') codexBlocks = true;
+                }
+                return codexBlocks;
+              }
+
               // feedback: comments and reviews ({ author, body, commitId? }). Review and
               // line comments carry commitId; a P0/P1 finding from a reviewer bot on the
-              // head commit blocks even if a summary says otherwise.
-              function reviewState({ labels, feedback, headSha, headRef }) {
+              // head commit blocks even if a summary says otherwise. Line comments also
+              // carry id, inReplyToId, originalCommitId and createdAt (see above).
+              // Returns 'blocking' | 'answered' | 'missing' | 'clear'.
+              function reviewState({ labels, feedback, headSha, headRef, owner }) {
                 if (labels.includes('review:blocking')) return 'blocking';
                 // On a Codex-written PR the primary review must be Codex's own; a Claude
                 // verdict is the separate second review (secondReview), never both.
@@ -254,7 +331,11 @@ jobs:
                 // so overriding or clearing them can never stand in for Codex's own review.
                 const primary = codexPr ? feedback.filter((x) => x.author === CODEX_BOT) : feedback;
                 const verdicts = primary.map((x) => verdictFor(x, headSha)).filter(Boolean);
-                if ((!codexPr && findings.length) || verdicts.includes('blocking')) return 'blocking';
+                const otherFindings = !codexPr && findings.length > 0;
+                if (otherFindings || verdicts.includes('blocking')) {
+                  const answered = !otherFindings && onlyCodexStateBlocks(primary, headSha) && codexFindingsAnswered({ feedback, headSha, owner });
+                  return answered ? 'answered' : 'blocking';
+                }
                 if (verdicts.includes('pending')) return 'missing';
                 return verdicts.includes('clear') ? 'clear' : 'missing';
               }
@@ -319,28 +400,34 @@ jobs:
               function decide(input) {
                 const { risk, reasons, agentWhy = null } = classify(input);
                 const raw = reviewState(input);
-                const overridden = raw === 'blocking' && reviewOverridden(input);
+                // `answered` is still a block as far as review:override is concerned.
+                const overridden = (raw === 'blocking' || raw === 'answered') && reviewOverridden(input);
                 const review = overridden ? 'clear' : raw;
+                const answered = review === 'answered';
                 const approved = humanApproved(input);
                 const second = secondReview(input);
                 // review:override (owner, same rules as approval) also overrules a blocking Claude review.
                 const overridden2 = second === 'blocking' && reviewOverridden(input);
                 let state; let description;
                 if (input.draft) { state = 'pending'; description = 'Draft PR'; }
-                else if (review === 'blocking') { state = 'failure'; description = 'Reviewer has unresolved findings on this commit (or review:blocking)'; }
+                // Answered findings never let a PR merge without the owner: for risk:low and
+                // risk:agent they block exactly as unresolved findings do.
+                else if (review === 'blocking' || (answered && risk !== 'normal')) { state = 'failure'; description = 'Reviewer has unresolved findings on this commit (or review:blocking)'; }
                 else if (review === 'missing') { state = 'pending'; description = 'Waiting for a completed review of this commit'; }
                 else if (second === 'blocking' && !overridden2) { state = 'failure'; description = 'Claude review of this Codex PR found P0/P1 issues'; }
                 // The owner's own approval of this commit stands in for a missing Claude review.
                 else if (second === 'missing' && !approved) { state = 'pending'; description = 'Codex PR: waiting for the Claude review of this commit'; }
                 else if (risk === 'low') { state = 'success'; description = overridden ? 'risk:low; review findings overridden by owner' : 'risk:low and reviewed'; }
                 else if (risk === 'agent') { state = 'success'; description = overridden ? 'risk:agent; review findings overridden by owner' : 'risk:agent (agent-safe) and reviewed'; }
-                else if (approved) { state = 'success'; description = overridden ? 'human-approved; review findings overridden by owner' : 'human-approved and reviewed'; }
+                // Only risk:normal reaches here with `answered`.
+                else if (approved) { state = 'success'; description = overridden ? 'human-approved; review findings overridden by owner' : answered ? 'human-approved; reviewer findings answered, not resolved' : 'human-approved and reviewed'; }
                 else if (input.labels.includes('human-approved')) { state = 'pending'; description = withReason('risk:normal: approval predates this commit; remove and re-add human-approved', agentWhy); }
+                else if (answered) { state = 'pending'; description = withReason('risk:normal: waiting for human-approved — reviewer findings answered, not resolved', agentWhy); }
                 else { state = 'pending'; description = withReason('risk:normal: waiting for human-approved', agentWhy); }
                 return { risk, reasons, agentWhy, review, secondReview: second, overridden, approved, state, description };
               }
 
-              module.exports = { ACTIONS_BOT, secondReview, pathsOf, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
+              module.exports = { ACTIONS_BOT, codexFindingsAnswered, secondReview, pathsOf, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
 
               return module.exports; })();
             const { owner, repo } = context.repo;
@@ -402,7 +489,9 @@ jobs:
                 labelEvents,
                 feedback: [
                   ...reviews.map((r) => ({ author: r.user?.login || '', body: r.body, commitId: r.commit_id })),
-                  ...reviewComments.map((c) => ({ author: c.user?.login || '', body: c.body, commitId: c.commit_id })),
+                  // Line comments also carry their thread fields, for answered findings (gate.js).
+                  ...reviewComments.map((c) => ({ author: c.user?.login || '', body: c.body, commitId: c.commit_id,
+                    id: c.id, inReplyToId: c.in_reply_to_id, originalCommitId: c.original_commit_id, createdAt: c.created_at })),
                   ...comments.map((c) => ({ author: c.user?.login || '', body: c.body })),
                 ],
                 headSha,
