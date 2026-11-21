@@ -434,3 +434,9 @@ test('description: risk:low, risk:agent and other descriptions are unchanged, ag
   assert.equal(g.decide({ ...agentPr, feedback: [] }).description, 'Waiting for a completed review of this commit');
   assert.equal(g.decide({ ...agentPr, draft: true }).description, 'Draft PR');
 });
+
+test('a Codex review with unresolved findings (any severity) fails with the unresolved-findings text', () => {
+  const d = g.decide({ ...base, feedback: [codex('H', true)] });
+  assert.equal(d.state, 'failure');
+  assert.equal(d.description, 'Reviewer has unresolved findings on this commit (or review:blocking)');
+});

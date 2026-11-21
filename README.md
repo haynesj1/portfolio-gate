@@ -2,7 +2,7 @@
 
 A merge gate for repositories where AI coding agents open pull requests. It sets one required commit status, `review-gate`, that passes only when:
 
-1. **a reviewer bot has reviewed the current head commit** with no unresolved P0/P1 findings (Codex's review summary, or a structured verdict from a Claude reviewer), and
+1. **a reviewer bot has reviewed the current head commit** with no unresolved findings from Codex, and no unresolved P0/P1 finding from any other reviewer (Codex's review summary, or a structured verdict from a Claude reviewer), and
 2. one of:
    - **the change is low risk** (`risk:low`: docs, added tests, Dependabot patch bumps, deletion-only dead-code removal);
    - **the change is agent-safe** (`risk:agent`, opt-in per repo, see below);
