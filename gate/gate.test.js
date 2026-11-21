@@ -358,6 +358,26 @@ test('test removals are caught in any language and any file (Codex P2)', () => {
   assert.equal(g.classify({ ...base, files: [f('pkg/a_test.go', '+func TestNew(t *testing.T) {}')] }).risk, 'low');
 });
 
+test('the removed-test backstop skips Markdown files outside test paths', () => {
+  const code = f('src/app.ts', '-const x = 1;\n+const x = 2;');
+  const run = (file) => g.classify({ ...agentPr, files: [code, file] });
+  const ren = (from, to, patch) => f(to, patch, { status: 'renamed', previous_filename: from });
+  // Markdown outside test paths: prose that looks like a test line is not counted
+  assert.equal(run(f('docs/guide.md', '-  "context": {')).risk, 'agent');
+  assert.equal(run(f('notes.md', '-We assert that the cache is warm.')).risk, 'agent');
+  assert.equal(run(f('docs/guide.md', '+The review is pending')).risk, 'agent');
+  assert.equal(run(ren('docs/a.md', 'docs/b.md', '-  "context": {')).risk, 'agent');
+  // the backstop still applies to everything else
+  const kept = (file, why) => { const r = run(file); assert.equal(r.risk, 'normal'); assert.equal(r.agentWhy, why); };
+  kept(f('src/a.ts', '-  "context": {'), 'test or assertion line removed in src/a.ts');
+  kept(f('docs/example.rs', '-  "context": {'), 'test or assertion line removed in docs/example.rs');
+  kept(ren('src/a.rs', 'notes.md', '-#[test]'), 'test or assertion line removed in notes.md');
+  kept(ren('notes.md', 'src/a.rs', '-#[test]'), 'test or assertion line removed in src/a.rs');
+  kept(f('notes.MD', '-#[test]'), 'test or assertion line removed in notes.MD');
+  kept(f('tests/README.md', "-it('works', () => {})"), 'test or assertion line removed in tests/README.md');
+  kept(f('docs/decisions/0009-x.md', '-  "context": {'), 'protected path docs/decisions/0009-x.md');
+});
+
 // ---- real app .ops.yml files (copied into gate/fixtures) -------------------
 test('every real app .ops.yml parses: today without the tier, and with the proposed policy', () => {
   const fs = require('node:fs'); const path = require('node:path');
