@@ -221,9 +221,135 @@ function isPatchBump(title) {
   return !!m && m[1] === m[4] && m[2] === m[5];
 }
 
+// Approved copies (issue #19). A file the owner approved once at its source
+// (the shared caller workflow, a shared block of an instruction file) is
+// rolled out to many repositories. The list in gate/approved-copies.json is
+// embedded at build time (never read from the PR or fetched at run time), and
+// a PR is risk:low only when EVERY changed file is added or modified (never
+// removed, renamed or otherwise) and its content at the head SHA proves it:
+//  - `files`: the whole file hashes to a listed value;
+//  - `blocks`: the text from the start marker to the end marker inclusive
+//    hashes to a listed value, the file has exactly one of each marker at both
+//    head and base, and the text before and after the block is identical to
+//    the base copy (so the file must already exist on the base).
+// Hash: SHA-256 of the UTF-8 text with line endings normalised to `\n`.
+// Anything else, including a read that failed, is not an approved copy and
+// the existing rules apply unchanged. The workflow script does the reads and
+// passes the decoded text in; this code only decides.
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+const COPY_STATUSES = new Set(['added', 'modified']);
+const ENTRY_KEYS = { files: ['path', 'sha256'], blocks: ['path', 'start', 'end', 'sha256'] };
+const normaliseNewlines = (text) => text.replace(/\r\n?/g, '\n');
+// Required lazily so that a missing crypto module can only fail an approved-copy check (closed).
+const copyHash = (text) => require('node:crypto').createHash('sha256').update(normaliseNewlines(text), 'utf8').digest('hex');
+const isPlainObject = (x) => !!x && typeof x === 'object' && !Array.isArray(x);
+
+// Returns null for a well-formed list, else what is wrong with it. A list that
+// is not well formed approves nothing (and gate/build.js refuses to build it).
+function approvedListError(list) {
+  if (!isPlainObject(list)) return 'the list is not an object';
+  for (const k of Object.keys(list)) if (!Object.hasOwn(ENTRY_KEYS, k)) return `unknown key ${k}`;
+  const seen = new Set();
+  for (const kind of ['files', 'blocks']) {
+    const entries = list[kind] === undefined ? [] : list[kind];
+    if (!Array.isArray(entries)) return `${kind} is not a list`;
+    for (const e of entries) {
+      if (!isPlainObject(e)) return `${kind}: an entry is not an object`;
+      for (const k of Object.keys(e)) if (!ENTRY_KEYS[kind].includes(k)) return `${kind}: unknown key ${k}`;
+      const p = e.path;
+      if (typeof p !== 'string' || !p || p.split('/').some((s) => s === '' || s === '.' || s === '..') || /[\u0000-\u001f\\]/.test(p)) return `${kind}: bad path ${JSON.stringify(p)}`;
+      // Dependency manifests and package-manager config keep their own rules.
+      if (isDependencyFile(p) || isPackageConfig(p)) return `${kind}: ${p} is a dependency or package-manager file`;
+      if (seen.has(p)) return `${p} is listed more than once`;
+      seen.add(p);
+      if (!Array.isArray(e.sha256) || !e.sha256.every((h) => typeof h === 'string' && SHA256_HEX.test(h))) return `${p}: sha256 must be a list of lowercase hex SHA-256 values`;
+      if (kind === 'blocks') {
+        for (const m of [e.start, e.end]) if (typeof m !== 'string' || !m || /[\r\n]/.test(m)) return `${p}: markers must be non-empty single-line strings`;
+        if (e.start.includes(e.end) || e.end.includes(e.start)) return `${p}: one marker contains the other`;
+      }
+    }
+  }
+  return null;
+}
+
+// Which reads an approved-copy check needs: [{ path, kind }] when every changed
+// file is a listed path with an allowed status, else null (no reads at all).
+// `file` entries need the head only; `block` entries need head and base.
+function approvedCopyPlan(list, files) {
+  if (approvedListError(list) || !Array.isArray(files) || !files.length) return null;
+  const listed = new Map([
+    ...(list.files || []).map((e) => [e.path, { kind: 'file', entry: e }]),
+    ...(list.blocks || []).map((e) => [e.path, { kind: 'block', entry: e }]),
+  ]);
+  const plan = [];
+  for (const f of files) {
+    const hit = listed.get(f?.filename);
+    if (!hit || plan.some((p) => p.path === f.filename)) return null;
+    if (!COPY_STATUSES.has(f.status) || f.previous_filename) return null;
+    // A block is approved against the base copy, so the file must exist there.
+    if (hit.kind === 'block' && f.status !== 'modified') return null;
+    plan.push({ path: f.filename, ...hit });
+  }
+  return plan;
+}
+
+// Occurrences of `needle` in `text`, overlapping ones included.
+function occurrences(text, needle) {
+  let n = 0;
+  for (let i = text.indexOf(needle); i !== -1; i = text.indexOf(needle, i + 1)) n++;
+  return n;
+}
+// The one block in `text`, with the text before and after it; null unless
+// there is exactly one start marker and one end marker, in that order.
+function blockOf(text, { start, end }) {
+  if (occurrences(text, start) !== 1 || occurrences(text, end) !== 1) return null;
+  const s = text.indexOf(start);
+  const e = text.indexOf(end);
+  if (e < s + start.length) return null;
+  return { before: text.slice(0, s), block: text.slice(s, e + end.length), after: text.slice(e + end.length) };
+}
+
+// The decoded text of a contents API response for `path`, or null for
+// anything that is not a whole, readable UTF-8 file at exactly that path
+// (a directory, symlink or submodule, a file over the API's size limit, a
+// size mismatch, invalid UTF-8 or a NUL byte). A byte-order mark is kept.
+function decodeContent(data, path) {
+  if (!isPlainObject(data) || data.type !== 'file' || data.path !== path || data.encoding !== 'base64') return null;
+  if (typeof data.content !== 'string' || !/^[A-Za-z0-9+/=\s]*$/.test(data.content) || !Number.isInteger(data.size)) return null;
+  const bytes = Buffer.from(data.content, 'base64');
+  if (bytes.length !== data.size || bytes.includes(0)) return null;
+  try { return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes); } catch { return null; }
+}
+
+// list: the embedded approved list. contents: Map path → { head, base }, the
+// decoded text at the head and base SHAs (null where a read failed).
+// Returns { ok: true, reasons } only when every changed file is an approved copy.
+function approvedCopy({ list, files, contents }) {
+  const no = { ok: false };
+  try {
+    const plan = approvedCopyPlan(list, files);
+    if (!plan || !(contents instanceof Map)) return no;
+    for (const { path, kind, entry } of plan) {
+      const { head, base } = contents.get(path) || {};
+      if (typeof head !== 'string') return no;
+      if (kind === 'file') { if (!entry.sha256.includes(copyHash(head))) return no; continue; }
+      if (typeof base !== 'string') return no;
+      const h = blockOf(head, entry);
+      const b = blockOf(base, entry);
+      // Outside the block, byte-identical to the base (no newline normalisation).
+      if (!h || !b || h.before !== b.before || h.after !== b.after) return no;
+      if (!entry.sha256.includes(copyHash(h.block))) return no;
+    }
+    return { ok: true, reasons: plan.map((p) => `approved copy of ${p.path}`) };
+  } catch { return no; }
+}
+
 // commits: authors of every commit on the PR (logins), used so that code
 // pushed onto a Dependabot branch by anyone else loses the Dependabot path.
-function classify({ author, title, labels, files, commitAuthors = [], headRef, policy, issue }) {
+// approvedCopies / copyContents: see approvedCopy above (absent: no approved copies).
+function classify({ author, title, labels, files, commitAuthors = [], headRef, policy, issue, approvedCopies, copyContents }) {
+  const copy = approvedCopy({ list: approvedCopies, files, contents: copyContents });
+  if (copy.ok) return { risk: 'low', reasons: copy.reasons, agentWhy: null };
   const protectedPaths = files.flatMap(pathsOf).filter(isProtected);
   if (protectedPaths.length) { const reasons = protectedPaths.map((n) => `protected path ${n}`); return { risk: 'normal', reasons, agentWhy: reasons[0] }; }
   if (author === 'dependabot[bot]') {
@@ -459,4 +585,4 @@ function decide(input) {
   return { risk, reasons, agentWhy, review, secondReview: second, overridden, approved, state, description };
 }
 
-module.exports = { ACTIONS_BOT, codexFindingsAnswered, secondReview, pathsOf, countTestLines, countPrTestLines, REMOVED_TEST_LINE, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
+module.exports = { approvedListError, approvedCopyPlan, approvedCopy, decodeContent, copyHash, ACTIONS_BOT,codexFindingsAnswered, secondReview, pathsOf, countTestLines, countPrTestLines, REMOVED_TEST_LINE, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };

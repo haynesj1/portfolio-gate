@@ -11,7 +11,8 @@ const start = lines.findIndex((l) => l.trim() === 'script: |') + 1;
 const body = [];
 for (const l of lines.slice(start)) { if (l.trim() && !l.startsWith('            ')) break; body.push(l.slice(12)); }
 const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
-const script = new AsyncFunction('github', 'context', 'core', body.join('\n'));
+// github-script passes `require` too (gate.js uses node:crypto for approved copies).
+const script = new AsyncFunction('github', 'context', 'core', 'require', body.join('\n'));
 
 const OWNER = 'haynesj1';
 const ACTIONS = { login: 'github-actions[bot]' };
@@ -23,13 +24,13 @@ const labelled = (at, extra = {}) => ({ event: 'labeled', label: { name: 'human-
 const run = (sha, at, pr = 1, path = '.github/workflows/pr-gate.yml') => ({ head_sha: sha, created_at: at, path, pull_requests: [{ number: pr }] });
 const code = [{ filename: 'src/app.ts', status: 'modified', patch: '+x', additions: 1 }];
 
-function harness({ headSha = 'H', event = 'pull_request_target', action = 'synchronize', files = code, comments = [], timeline = [], runs = [], labels = [], headRef = 'feature', ops = null, issue = null, openPrs = [], issueEvent = null, pushRef = undefined, reviewComments = [] }) {
-  const written = []; const added = []; const seenRefs = [];
+function harness({ headSha = 'H', event = 'pull_request_target', action = 'synchronize', files = code, comments = [], timeline = [], runs = [], labels = [], headRef = 'feature', ops = null, issue = null, openPrs = [], issueEvent = null, pushRef = undefined, reviewComments = [], baseSha = 'BASE', contents = {} }) {
+  const written = []; const added = []; const seenRefs = []; const contentReads = [];
   const github = {
     paginate: async (fn, args) => fn(args),
     rest: {
       pulls: {
-        get: async () => ({ data: { state: 'open', draft: false, title: 't', body: '', user: { login: OWNER }, labels: labels.map((name) => ({ name })), head: { sha: headSha, ref: headRef }, base: { repo: { default_branch: 'main' } } } }),
+        get: async () => ({ data: { state: 'open', draft: false, title: 't', body: '', user: { login: OWNER }, labels: labels.map((name) => ({ name })), head: { sha: headSha, ref: headRef }, base: { sha: baseSha, repo: { default_branch: 'main' } } } }),
         listFiles: async () => files,
         list: async () => openPrs,
         listCommits: async () => [{ author: { login: OWNER } }],
@@ -45,7 +46,17 @@ function harness({ headSha = 'H', event = 'pull_request_target', action = 'synch
       },
       repos: {
         createCommitStatus: async (s) => written.push(s),
-        getContent: async ({ ref }) => { if (!ops) throw Object.assign(new Error('nf'), { status: 404 }); seenRefs.push(ref); return { data: { content: Buffer.from(ops).toString('base64') } }; },
+        // contents: `${ref}:${path}` -> file text, or a contents API response object.
+        getContent: async ({ path: p, ref }) => {
+          if (p !== '.ops.yml') {
+            contentReads.push(`${ref}:${p}`);
+            const c = contents[`${ref}:${p}`];
+            if (c === undefined) throw Object.assign(new Error('nf'), { status: 404 });
+            if (typeof c !== 'string') return { data: c };
+            const buf = Buffer.from(c, 'utf8');
+            return { data: { type: 'file', path: p, encoding: 'base64', size: buf.length, content: buf.toString('base64') } };
+          }
+          if (!ops) throw Object.assign(new Error('nf'), { status: 404 }); seenRefs.push(ref); return { data: { content: Buffer.from(ops).toString('base64') } }; },
       },
       actions: { listWorkflowRunsForRepo: async ({ head_sha: sha, event: ev }) => runs.filter((r) => r.head_sha === sha && ev === 'pull_request_target') },
     },
@@ -55,7 +66,7 @@ function harness({ headSha = 'H', event = 'pull_request_target', action = 'synch
     payload: issueEvent || { action, label: action === 'labeled' ? { name: 'human-approved' } : undefined, pull_request: { number: 1, updated_at: '2026-11-06T10:00:00Z' } },
   };
   const core = { info() {}, warning() {}, summary: { addHeading() { return this; }, addList() { return this; }, write: async () => {} } };
-  return { github, run: () => script(github, context, core), written, added, seenRefs, gate: () => written.filter((s) => s.context === 'review-gate').at(-1) };
+  return { github, run: () => script(github, context, core, require), written, added, seenRefs, contentReads, gate: () => written.filter((s) => s.context === 'review-gate').at(-1) };
 }
 
 test('workflow: owner approval after the head was first seen passes', async () => {
@@ -371,4 +382,75 @@ test('workflow: answered Codex findings pass their thread fields through; the PR
   const docs = harness({ files: [{ filename: 'README.md', status: 'modified', patch: '+x', additions: 1 }], comments: [codexComment('H', true)], reviewComments });
   await docs.run();
   assert.equal(docs.gate().state, 'failure');
+});
+
+// ---- approved copies (#19) ----------------------------------------------
+const CALLER = '.github/workflows/pr-gate.yml';
+const callerText = fs.readFileSync(path.join(__dirname, '..', 'caller', 'pr-gate.yml'), 'utf8');
+const HEX_HEAD = 'a'.repeat(40);
+const HEX_BASE = 'b'.repeat(40);
+const callerPr = (extra = {}) => harness({ headSha: HEX_HEAD, baseSha: HEX_BASE, files: [{ filename: CALLER, status: 'modified', patch: '+x', additions: 1 }],
+  comments: [codexComment(HEX_HEAD)], runs: [run(HEX_HEAD, '2026-11-06T09:00:00Z')], ...extra });
+
+test('workflow: the build embeds the hash of this repo\'s caller in the approved list (#19)', () => {
+  const g = require('./gate');
+  const m = /const APPROVED_COPIES = (.*);$/m.exec(yml);
+  const list = JSON.parse(m[1]);
+  assert.equal(g.approvedListError(list), null);
+  assert.deepEqual(list.blocks, []);
+  assert.deepEqual(list.files, [{ path: CALLER, sha256: [g.copyHash(callerText)] }]);
+});
+
+test('workflow: a PR that only updates the caller to the approved copy is risk:low, read once at the head SHA (#19)', async () => {
+  const h = callerPr({ contents: { [`${HEX_HEAD}:${CALLER}`]: callerText } });
+  await h.run();
+  assert.equal(h.gate().state, 'success');
+  assert.equal(h.gate().description, 'risk:low and reviewed');
+  assert.deepEqual(h.added, ['risk:low']);
+  assert.deepEqual(h.contentReads, [`${HEX_HEAD}:${CALLER}`]);
+  // CRLF line endings hash the same.
+  const crlf = callerPr({ contents: { [`${HEX_HEAD}:${CALLER}`]: callerText.replace(/\n/g, '\r\n') } });
+  await crlf.run();
+  assert.deepEqual(crlf.added, ['risk:low']);
+  // Review still required: an unfinished review waits.
+  const unreviewed = callerPr({ comments: [codexComment(HEX_HEAD, null, 'running')], contents: { [`${HEX_HEAD}:${CALLER}`]: callerText } });
+  await unreviewed.run();
+  assert.equal(unreviewed.gate().state, 'pending');
+  assert.deepEqual(unreviewed.added, ['risk:low']);
+});
+
+test('workflow: a near-miss copy of the caller is risk:normal with the protected-path reason (#19)', async () => {
+  const WAIT_CALLER = `risk:normal: waiting for human-approved — protected path ${CALLER}`;
+  const h = callerPr({ contents: { [`${HEX_HEAD}:${CALLER}`]: `${callerText}# one more line\n` } });
+  await h.run();
+  assert.equal(h.gate().state, 'pending');
+  assert.equal(h.gate().description, WAIT_CALLER);
+  assert.deepEqual(h.added, ['risk:normal']);
+  // A failed read is not an approved copy, and the run still publishes.
+  const failed = callerPr({});
+  await failed.run();
+  assert.equal(failed.gate().description, WAIT_CALLER);
+  // A file over the contents API size limit (no content returned) is not either.
+  const big = callerPr({ contents: { [`${HEX_HEAD}:${CALLER}`]: { type: 'file', path: CALLER, encoding: 'none', size: 2_000_000, content: '' } } });
+  await big.run();
+  assert.equal(big.gate().description, WAIT_CALLER);
+  // A head that is not a commit SHA is never read (no fallback to a branch).
+  const odd = callerPr({ headSha: 'H', comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')], contents: { [`H:${CALLER}`]: callerText } });
+  await odd.run();
+  assert.deepEqual(odd.contentReads, []);
+  assert.deepEqual(odd.added, ['risk:normal']);
+});
+
+test('workflow: no content is read unless every changed file is a listed path (#19)', async () => {
+  const files = [{ filename: CALLER, status: 'modified', patch: '+x', additions: 1 }, { filename: 'README.md', status: 'modified', patch: '+x', additions: 1 }];
+  const h = callerPr({ files, contents: { [`${HEX_HEAD}:${CALLER}`]: callerText } });
+  await h.run();
+  assert.deepEqual(h.contentReads, []);
+  assert.deepEqual(h.added, ['risk:normal']);
+  for (const status of ['removed', 'renamed']) {
+    const r = callerPr({ files: [{ filename: CALLER, previous_filename: status === 'renamed' ? '.github/workflows/old.yml' : undefined, status, patch: '', additions: 0 }], contents: { [`${HEX_HEAD}:${CALLER}`]: callerText } });
+    await r.run();
+    assert.deepEqual(r.contentReads, [], status);
+    assert.deepEqual(r.added, ['risk:normal'], status);
+  }
 });

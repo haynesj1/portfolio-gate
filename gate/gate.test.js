@@ -752,3 +752,209 @@ test('answered: review:override behaves as today', () => {
 test('answered: a draft PR stays a draft', () => {
   expectState({ ...answeredPr, draft: true }, 'pending', 'Draft PR');
 });
+
+// ---- approved copies (#19) -----------------------------------------------
+const COPY = '.github/workflows/pr-gate.yml';
+const DOC = 'AGENTS.md';
+const START = '<!-- shared:start -->';
+const END = '<!-- shared:end -->';
+const BLOCK = `${START}\nShared rules.\n${END}`;
+const BLOCK2 = `${START}\nShared rules, version two.\n${END}`;
+const CALLER_TEXT = 'name: pr-gate\non: {}\n';
+const BASE_DOC = `# Rules\n\nLocal text.\n\n${BLOCK}\n\nMore local text.\n`;
+const HEAD_DOC = BASE_DOC.replace(BLOCK, BLOCK2);
+const LIST = {
+  files: [{ path: COPY, sha256: [g.copyHash(CALLER_TEXT)] }],
+  blocks: [{ path: DOC, start: START, end: END, sha256: [g.copyHash(BLOCK2)] }],
+};
+const contentsOf = (obj) => new Map(Object.entries(obj));
+const copyInput = (files, contents, list = LIST) => ({ ...base, files, approvedCopies: list, copyContents: contentsOf(contents) });
+const WAIT_COPY = `${WAIT} — protected path ${COPY}`;
+
+test('approved copies: a whole-file copy and a block copy are risk:low with "approved copy of <path>"', () => {
+  const r = g.classify(copyInput([f(COPY)], { [COPY]: { head: CALLER_TEXT } }));
+  assert.deepEqual(r, { risk: 'low', reasons: [`approved copy of ${COPY}`], agentWhy: null });
+  assert.equal(g.classify(copyInput([f(COPY, '+x', { status: 'added' })], { [COPY]: { head: CALLER_TEXT } })).risk, 'low');
+  const both = g.classify(copyInput([f(COPY), f(DOC)], { [COPY]: { head: CALLER_TEXT }, [DOC]: { head: HEAD_DOC, base: BASE_DOC } }));
+  assert.deepEqual(both, { risk: 'low', reasons: [`approved copy of ${COPY}`, `approved copy of ${DOC}`], agentWhy: null });
+  const d = g.decide(copyInput([f(COPY)], { [COPY]: { head: CALLER_TEXT } }));
+  assert.equal(d.state, 'success');
+  assert.equal(d.description, 'risk:low and reviewed');
+});
+
+test('approved copies: removed, renamed or other statuses are not approved copies', () => {
+  for (const extra of [{ status: 'removed' }, { status: 'renamed', previous_filename: '.github/workflows/old.yml' }, { status: 'renamed', previous_filename: COPY }, { status: 'copied' }, { status: 'changed' }, { status: undefined }]) {
+    const r = g.classify(copyInput([f(COPY, '+x', extra)], { [COPY]: { head: CALLER_TEXT } }));
+    assert.equal(r.risk, 'normal', JSON.stringify(extra));
+  }
+});
+
+test('approved copies: one other changed file puts the whole PR through the existing rules unchanged', () => {
+  const contents = { [COPY]: { head: CALLER_TEXT } };
+  for (const other of [f('README.md'), f('src/app.ts'), f('.github/workflows/ci.yml'), f('package.json')]) {
+    const files = [f(COPY), other];
+    assert.deepEqual(g.classify(copyInput(files, contents)), g.classify({ ...base, files }), other.filename);
+    assert.equal(g.classify(copyInput(files, contents)).risk, 'normal');
+  }
+  // The same file listed twice in the PR's file list is not a copy either.
+  assert.equal(g.classify(copyInput([f(COPY), f(COPY)], contents)).risk, 'normal');
+});
+
+test('approved copies: a listed path whose head matches no listed hash keeps the protected-path reason', () => {
+  const r = g.classify(copyInput([f(COPY)], { [COPY]: { head: `${CALLER_TEXT}# extra\n` } }));
+  assert.deepEqual(r.reasons[0], `protected path ${COPY}`);
+  assert.equal(r.risk, 'normal');
+  assert.equal(g.decide(copyInput([f(COPY)], { [COPY]: { head: `${CALLER_TEXT}x` } })).description, WAIT_COPY);
+  // An empty hash list approves nothing.
+  const empty = { files: [{ path: COPY, sha256: [] }], blocks: [] };
+  assert.equal(g.classify(copyInput([f(COPY)], { [COPY]: { head: CALLER_TEXT } }, empty)).risk, 'normal');
+});
+
+test('approved copies: hashes are of the text with line endings normalised to \\n', () => {
+  assert.equal(g.copyHash('a\r\nb\rc\n'), g.copyHash('a\nb\nc\n'));
+  assert.equal(g.copyHash(''), 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+  assert.equal(g.classify(copyInput([f(COPY)], { [COPY]: { head: CALLER_TEXT.replace(/\n/g, '\r\n') } })).risk, 'low');
+  // A block whose own text uses CRLF hashes the same...
+  const crlf = (t) => t.replace(/\n/g, '\r\n');
+  assert.equal(g.classify(copyInput([f(DOC)], { [DOC]: { head: crlf(HEAD_DOC), base: crlf(BASE_DOC) } })).risk, 'low');
+  // ...but outside the block the file must be byte-identical: changing only line endings there is a change.
+  const headMixed = BASE_DOC.replace(BLOCK, BLOCK2).replace('Local text.\n', 'Local text.\r\n');
+  assert.equal(g.classify(copyInput([f(DOC)], { [DOC]: { head: headMixed, base: BASE_DOC } })).risk, 'normal');
+});
+
+test('approved copies: block entries fail on a change outside the markers, a missing or duplicated marker, or a new file', () => {
+  const block = (head, baseText = BASE_DOC, extra = {}) => g.classify(copyInput([f(DOC, '+x', extra)], { [DOC]: { head, base: baseText } })).risk;
+  assert.equal(block(HEAD_DOC), 'low');
+  assert.equal(block(HEAD_DOC.replace('Local text.', 'Changed text.')), 'normal');
+  assert.equal(block(HEAD_DOC.replace('More local text.\n', 'More local text.\nAdded line.\n')), 'normal');
+  assert.equal(block(HEAD_DOC.replace('# Rules', '# Rules ')), 'normal');
+  // Text moved from after the block to before it is still a change outside it.
+  assert.equal(block(`# Rules\n\nLocal text.\n\nMore local text.\n${BLOCK2}\n\n`, `# Rules\n\nLocal text.\n\n${BLOCK}\n\nMore local text.\n`), 'normal');
+  // Markers at head: missing, duplicated, or in the wrong order.
+  assert.equal(block(HEAD_DOC.replace(START, '')), 'normal');
+  assert.equal(block(HEAD_DOC.replace(END, '')), 'normal');
+  assert.equal(block(`${HEAD_DOC}${START}\n`), 'normal');
+  assert.equal(block(`${HEAD_DOC}${END}\n`), 'normal');
+  assert.equal(block(`${END}\nShared rules, version two.\n${START}\n`, `${END}\nShared rules.\n${START}\n`), 'normal');
+  // Markers at base: missing or duplicated.
+  assert.equal(block(HEAD_DOC, BASE_DOC.replace(START, '')), 'normal');
+  assert.equal(block(HEAD_DOC, `${BASE_DOC}${END}\n`), 'normal');
+  assert.equal(block(HEAD_DOC, `${BASE_DOC}${START}\n`), 'normal');
+  // A file new on the head (added) is not a copy, even with a base read.
+  assert.equal(block(HEAD_DOC, BASE_DOC, { status: 'added' }), 'normal');
+  // The block's own text must match a listed hash.
+  assert.equal(block(BASE_DOC.replace(BLOCK, `${START}\nOther rules.\n${END}`)), 'normal');
+});
+
+test('approved copies: a failed or missing read is not an approved copy', () => {
+  const r = (contents) => g.classify(copyInput([f(DOC)], contents)).risk;
+  assert.equal(r({ [DOC]: { head: HEAD_DOC, base: null } }), 'normal');
+  assert.equal(r({ [DOC]: { head: null, base: BASE_DOC } }), 'normal');
+  assert.equal(r({}), 'normal');
+  assert.equal(g.classify(copyInput([f(COPY)], {})).risk, 'normal');
+  assert.equal(g.classify({ ...base, files: [f(COPY)], approvedCopies: LIST }).risk, 'normal');
+  assert.equal(g.classify({ ...base, files: [f(COPY)], approvedCopies: LIST, copyContents: { [COPY]: { head: CALLER_TEXT } } }).risk, 'normal');
+});
+
+test('approved copies: the review of the head commit must still be complete and clean', () => {
+  const input = (feedback, extra = {}) => ({ ...copyInput([f(COPY)], { [COPY]: { head: CALLER_TEXT } }), feedback, ...extra });
+  assert.equal(g.decide(input([codex('H', false, 'running')])).state, 'pending');
+  assert.equal(g.decide(input([])).state, 'pending');
+  assert.equal(g.decide(input([codex('OLD')])).state, 'pending');
+  assert.equal(g.decide(input([codex('H', true)])).state, 'failure');
+  assert.equal(g.decide(input([codex('H')], { labels: ['review:blocking'] })).state, 'failure');
+  assert.equal(g.decide(input([codex('H')], { draft: true })).state, 'pending');
+  // A Codex PR still needs the Claude second review.
+  assert.equal(g.decide(input([codex('H')], { headRef: 'codex/5' })).state, 'pending');
+  assert.equal(g.decide(input([codex('H'), claudeVerdict('H')], { headRef: 'codex/5' })).state, 'success');
+});
+
+test('approved copies: an empty list (or none) behaves exactly as before', () => {
+  const contents = { [COPY]: { head: CALLER_TEXT }, [DOC]: { head: HEAD_DOC, base: BASE_DOC } };
+  for (const list of [{ files: [], blocks: [] }, {}, undefined, null]) {
+    for (const files of [[f(COPY)], [f(DOC)], [f('README.md')], [f('src/app.ts')], []]) {
+      const input = { ...base, files, approvedCopies: list, copyContents: contentsOf(contents) };
+      assert.deepEqual(g.classify(input), g.classify({ ...base, files }), JSON.stringify([list, files]));
+      assert.deepEqual(g.decide(input), g.decide({ ...base, files }));
+    }
+    assert.equal(g.approvedCopyPlan(list, [f(COPY)]), null);
+  }
+});
+
+test('approved copies: a PR with no changed files is not an approved copy', () => {
+  assert.equal(g.approvedCopyPlan(LIST, []), null);
+  assert.deepEqual(g.approvedCopy({ list: LIST, files: [], contents: new Map() }), { ok: false });
+  assert.deepEqual(g.classify(copyInput([], {})), g.classify({ ...base, files: [] }));
+});
+
+test('approved copies: reads are planned only when every changed file is a listed path', () => {
+  assert.deepEqual(g.approvedCopyPlan(LIST, [f(COPY), f(DOC)]).map(({ path, kind }) => [path, kind]), [[COPY, 'file'], [DOC, 'block']]);
+  assert.equal(g.approvedCopyPlan(LIST, [f(COPY), f('README.md')]), null);
+  assert.equal(g.approvedCopyPlan(LIST, [f(DOC, '+x', { status: 'added' })]), null);
+  assert.equal(g.approvedCopyPlan(LIST, [f(COPY, '', { status: 'removed' })]), null);
+  assert.equal(g.approvedCopyPlan(LIST, [f(COPY, '', { status: 'renamed', previous_filename: 'x.yml' })]), null);
+  assert.equal(g.approvedCopyPlan(LIST, [f('.github/workflows/PR-GATE.yml')]), null);
+});
+
+test('approved copies: a malformed list approves nothing, and says why', () => {
+  const h = g.copyHash(CALLER_TEXT);
+  const bad = {
+    'not an object': [],
+    'unknown key': { files: [], extra: [] },
+    'files not a list': { files: {} },
+    'entry unknown key': { files: [{ path: COPY, sha256: [h], note: 'x' }] },
+    'both files and blocks': { files: [{ path: DOC, sha256: [h] }], blocks: [{ path: DOC, start: START, end: END, sha256: [h] }] },
+    'twice in files': { files: [{ path: COPY, sha256: [h] }, { path: COPY, sha256: [] }] },
+    'uppercase hash': { files: [{ path: COPY, sha256: [h.toUpperCase()] }] },
+    'short hash': { files: [{ path: COPY, sha256: ['abc'] }] },
+    'hash not a list': { files: [{ path: COPY, sha256: h }] },
+    'leading slash': { files: [{ path: `/${COPY}`, sha256: [h] }] },
+    'dot dot': { files: [{ path: `x/../${COPY}`, sha256: [h] }] },
+    'dependency manifest': { files: [{ path: 'package.json', sha256: [h] }] },
+    'package config': { files: [{ path: '.npmrc', sha256: [h] }] },
+    'empty marker': { blocks: [{ path: DOC, start: '', end: END, sha256: [h] }] },
+    'multi-line marker': { blocks: [{ path: DOC, start: `${START}\n`, end: END, sha256: [h] }] },
+    'marker inside the other': { blocks: [{ path: DOC, start: '<!-- shared -->', end: 'shared -->', sha256: [h] }] },
+  };
+  for (const [name, list] of Object.entries(bad)) {
+    assert.ok(g.approvedListError(list), name);
+    assert.equal(g.approvedCopyPlan(list, [f(list.files?.[0]?.path || DOC)]), null, name);
+  }
+  // A path in both lists is not approved under either rule.
+  const both = bad['both files and blocks'];
+  assert.equal(g.classify(copyInput([f(DOC)], { [DOC]: { head: CALLER_TEXT, base: BASE_DOC } }, both)).risk, 'normal');
+  assert.equal(g.approvedListError(LIST), null);
+  assert.equal(g.approvedListError({ files: [], blocks: [] }), null);
+});
+
+test('approved copies: content reads decode only a whole UTF-8 file at exactly that path', () => {
+  const resp = (text, extra = {}) => { const b = Buffer.from(text, 'utf8'); return { type: 'file', path: COPY, encoding: 'base64', size: b.length, content: b.toString('base64'), ...extra }; };
+  assert.equal(g.decodeContent(resp(CALLER_TEXT), COPY), CALLER_TEXT);
+  // GitHub wraps base64 at 60 columns.
+  const wrapped = resp('x'.repeat(200)); wrapped.content = wrapped.content.replace(/(.{60})/g, '$1\n');
+  assert.equal(g.decodeContent(wrapped, COPY), 'x'.repeat(200));
+  // A byte-order mark is kept, so the file is not the same copy.
+  assert.equal(g.decodeContent(resp('﻿a'), COPY), '﻿a');
+  assert.notEqual(g.copyHash(g.decodeContent(resp(`﻿${CALLER_TEXT}`), COPY)), g.copyHash(CALLER_TEXT));
+  // Over the contents API size limit: no content.
+  assert.equal(g.decodeContent({ type: 'file', path: COPY, encoding: 'none', size: 2_000_000, content: '' }, COPY), null);
+  assert.equal(g.decodeContent(resp(CALLER_TEXT, { size: 3 }), COPY), null);
+  // A symlink resolved to another path, a symlink, a submodule or a directory.
+  assert.equal(g.decodeContent(resp(CALLER_TEXT, { path: 'elsewhere.yml' }), COPY), null);
+  assert.equal(g.decodeContent(resp(CALLER_TEXT, { type: 'symlink' }), COPY), null);
+  assert.equal(g.decodeContent(resp(CALLER_TEXT, { type: 'submodule' }), COPY), null);
+  assert.equal(g.decodeContent([resp(CALLER_TEXT)], COPY), null);
+  assert.equal(g.decodeContent(null, COPY), null);
+  // Binary: invalid UTF-8 or a NUL byte.
+  const bin = Buffer.from([0x6e, 0xff, 0xfe, 0x0a]);
+  assert.equal(g.decodeContent({ type: 'file', path: COPY, encoding: 'base64', size: bin.length, content: bin.toString('base64') }, COPY), null);
+  assert.equal(g.decodeContent(resp('a\u0000b'), COPY), null);
+  assert.equal(g.decodeContent(resp(CALLER_TEXT, { content: '!!not base64!!' }), COPY), null);
+});
+
+test('approved copies: the shipped list has the caller entry and no block entries', () => {
+  const shipped = JSON.parse(require('node:fs').readFileSync(require('node:path').join(__dirname, 'approved-copies.json'), 'utf8'));
+  assert.equal(g.approvedListError(shipped), null);
+  assert.deepEqual(shipped.files.map((e) => e.path), [COPY]);
+  assert.deepEqual(shipped.blocks, []);
+});

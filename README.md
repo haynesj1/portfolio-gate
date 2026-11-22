@@ -4,7 +4,7 @@ A merge gate for repositories where AI coding agents open pull requests. It sets
 
 1. **a reviewer bot has reviewed the current head commit** with no unresolved findings from Codex, and no unresolved P0/P1 finding from any other reviewer (Codex's review summary, or a structured verdict from a Claude reviewer); for `risk:normal` PRs, Codex findings that are all answered also count once the owner approves (see below), and
 2. one of:
-   - **the change is low risk** (`risk:low`: docs, added tests, Dependabot patch bumps, deletion-only dead-code removal);
+   - **the change is low risk** (`risk:low`: docs, added tests, Dependabot patch bumps, deletion-only dead-code removal, approved copies of shared files);
    - **the change is agent-safe** (`risk:agent`, opt-in per repo, see below);
    - **the repository owner has approved this exact commit** with the `human-approved` label (`risk:normal`).
 
@@ -52,6 +52,25 @@ Policy parsing fails closed: blank lines and comments inside a path list are ski
 Because the tier depends on the linked issue, the caller also listens to `issues` events (closed, reopened, or a `ready` / `in-progress` / `pivotal` label change) and re-evaluates the open PRs that implement that issue. Marking an issue `pivotal` therefore withdraws an earlier agent-safe pass at once. Runs for the same PR can overlap (PR, comment and issue events use different concurrency groups), so any run that publishes a pass re-gathers every input from GitHub afterwards and decides again, republishing if the answer changed. The last writer has therefore always read every input after the last change. A change to `.ops.yml` on the default branch re-evaluates every open agent PR under the new policy: the caller has one narrow `push` trigger (default branch, `.ops.yml` only). Default-branch pushes only happen by merging a reviewed PR, so this runs trusted code. A push to any other branch runs that branch's own workflow files whatever the default caller says, so the trigger adds no new exposure. A test pins the trigger to exactly that shape. Merge this repo's gate change **before** syncing the caller to app repos, or the older gate will fail on issue events.
 
 Residual risk, accepted in portfolio-ops decision 0005: agents act with the owner's identity, so they can set issue labels such as `ready` or remove `pivotal`. The path, size and test rules and the review are the real controls; the daily merge audit and the dashboard's auto-merge digest catch the rest.
+
+## Approved copies
+
+The caller workflow and shared blocks of instruction files are rolled out to every repository that uses the gate, one PR per repository, each touching a protected path. A PR whose **every** changed file is an approved copy is `risk:low` (reason `approved copy of <path>`), so the owner approves the content once, here, instead of once per repository. The review of the head commit is still required, as for any `risk:low` PR.
+
+The list is [`gate/approved-copies.json`](gate/approved-copies.json), embedded into the generated workflow by `npm run build` (the gate never reads it from the PR or fetches it at run time):
+
+- `files`: `{ "path", "sha256": [...] }`. The whole file at the PR's head commit must hash to a listed value. The build adds the hash of this repository's own `caller/pr-gate.yml` to the entry for `.github/workflows/pr-gate.yml`, so the current caller is always approved.
+- `blocks`: `{ "path", "start", "end", "sha256": [...] }`. The text from the start marker to the end marker inclusive must hash to a listed value; the file must exist on the base with exactly one start and one end marker at both base and head, and everything outside the block must be byte-identical to the base copy.
+
+A copy must be added or modified (never removed or renamed), and the gate reads each listed file at the head SHA (and, for blocks, the base SHA) only when every changed file is a listed path. A failed read, a file over the contents API's 1 MB limit, a symlink, invalid UTF-8, a path listed twice, or any other doubt means "not an approved copy", and the existing rules apply (a protected path stays `risk:normal`). Other hashes are added by hand in a PR to this repository; `.github/` is protected here, so the rebuilt workflow needs the owner's approval. That is the one approval.
+
+Hashes are SHA-256 of the UTF-8 text with line endings normalised to `\n`. From this repository:
+
+```bash
+node -p "require('./gate/gate').copyHash(require('fs').readFileSync('path/to/file', 'utf8'))"
+```
+
+**Off switch:** with no entries (`{ "files": [], "blocks": [] }`, so no caller entry either) the gate reads nothing and behaves exactly as it did before approved copies.
 
 ## Why it looks the way it does
 

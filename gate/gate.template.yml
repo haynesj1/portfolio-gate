@@ -20,6 +20,9 @@ jobs:
             const gate = (() => { const module = { exports: {} };
 __GATE_JS__
               return module.exports; })();
+            // Approved copies (issue #19): embedded from gate/approved-copies.json at build time.
+            const APPROVED_COPIES = __APPROVED_COPIES__;
+            const copyReads = new Map(); // `${sha}:${path}` -> decoded text or null, for this run
             const { owner, repo } = context.repo;
             // Reads every input the gate decides on, fresh from GitHub.
             async function gather(number) {
@@ -65,6 +68,28 @@ __GATE_JS__
                 } catch (e) { core.info(`linked issue #${n} not readable: ${e.status || e.message}`); return null; }
               };
               const issue = await readIssue(issueNumber);
+              // Approved copies: read only when every changed file is a listed path,
+              // once per side per file, at the head and base SHAs (never a branch
+              // name). A failed or unusable read is null: not an approved copy.
+              // Content at a commit SHA never changes, so the re-check after a
+              // pass reuses this run's reads (copyReads) instead of repeating them.
+              const copyContents = new Map();
+              const readAt = async (path, sha) => {
+                if (typeof sha !== 'string' || !/^[0-9a-f]{40,64}$/.test(sha)) return null;
+                const key = `${sha}:${path}`;
+                if (!copyReads.has(key)) {
+                  copyReads.set(key, (async () => {
+                    try {
+                      const { data } = await github.rest.repos.getContent({ owner, repo, path, ref: sha });
+                      return gate.decodeContent(data, path);
+                    } catch (e) { core.info(`approved copy ${path}@${sha} not readable: ${e.status || e.message}`); return null; }
+                  })());
+                }
+                return copyReads.get(key);
+              };
+              for (const { path, kind } of gate.approvedCopyPlan(APPROVED_COPIES, files) || []) {
+                copyContents.set(path, { head: await readAt(path, headSha), base: kind === 'block' ? await readAt(path, pr.base?.sha) : null });
+              }
               const input = {
                 author: pr.user.login,
                 headRef: pr.head.ref,
@@ -87,6 +112,8 @@ __GATE_JS__
                 headSha,
                 headAdoptedAt: adopted[0],
                 forcePushTimes,
+                approvedCopies: APPROVED_COPIES,
+                copyContents,
               };
               return input;
             }
