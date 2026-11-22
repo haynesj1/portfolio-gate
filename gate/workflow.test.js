@@ -387,6 +387,7 @@ test('workflow: answered Codex findings pass their thread fields through; the PR
 // ---- approved copies (#19) ----------------------------------------------
 const CALLER = '.github/workflows/pr-gate.yml';
 const callerText = fs.readFileSync(path.join(__dirname, '..', 'caller', 'pr-gate.yml'), 'utf8');
+const approvedFile = JSON.parse(fs.readFileSync(path.join(__dirname, 'approved-copies.json'), 'utf8'));
 const HEX_HEAD = 'a'.repeat(40);
 const HEX_BASE = 'b'.repeat(40);
 const callerPr = (extra = {}) => harness({ headSha: HEX_HEAD, baseSha: HEX_BASE, files: [{ filename: CALLER, status: 'modified', patch: '+x', additions: 1 }],
@@ -397,8 +398,20 @@ test('workflow: the build embeds the hash of this repo\'s caller in the approved
   const m = /const APPROVED_COPIES = (.*);$/m.exec(yml);
   const list = JSON.parse(m[1]);
   assert.equal(g.approvedListError(list), null);
-  assert.deepEqual(list.blocks, []);
+  assert.deepEqual(list.blocks, approvedFile.blocks);
   assert.deepEqual(list.files, [{ path: CALLER, sha256: [g.copyHash(callerText)] }]);
+});
+
+test('workflow: the approved list holds the shared AGENTS.md block, embedded as listed (#22)', () => {
+  const g = require('./gate');
+  assert.equal(g.approvedListError(approvedFile), null);
+  assert.deepEqual(approvedFile.blocks, [{ path: 'AGENTS.md', start: '<!-- portfolio-ops:common:start -->', end: '<!-- portfolio-ops:common:end -->',
+    sha256: ['44c98b1b8251c9ae802aeafdc5b731e5f8a046e09bc5709f2f4e085cb28b3846'] }]);
+  // The built workflow embeds the same list (the build only adds the caller's hash to its file entry).
+  const embedded = JSON.parse(/const APPROVED_COPIES = (.*);$/m.exec(yml)[1]);
+  const expected = structuredClone(approvedFile);
+  expected.files.find((e) => e.path === CALLER).sha256.push(g.copyHash(callerText));
+  assert.deepEqual(embedded, expected);
 });
 
 test('workflow: a PR that only updates the caller to the approved copy is risk:low, read once at the head SHA (#19)', async () => {
