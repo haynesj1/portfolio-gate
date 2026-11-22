@@ -30,7 +30,7 @@ jobs:
 
               const PROTECTED = [
                 /^\.github\//, /^AGENTS\.md$/, /^CLAUDE\.md$/, /^\.ops\.yml$/, /^\.claude\//,
-                /^specs\//, /^docs\/vision\.md$/, /^docs\/decisions\//,
+                /^specs\//, /^docs\/vision\.md$/, /^docs\/features\.json$/, /^docs\/decisions\//,
               ];
               // Files named as tests: a test runner finds them by their name.
               const TEST_FILE_NAME = [

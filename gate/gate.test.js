@@ -19,7 +19,7 @@ test('docs-only and test-only additions are low risk', () => {
 });
 
 test('protected paths, code, removed or skipped tests are normal risk', () => {
-  for (const p of ['.github/workflows/ci.yml', 'AGENTS.md', 'CLAUDE.md', '.ops.yml', 'docs/vision.md', 'docs/decisions/0001-x.md', 'specs/reveal.md']) {
+  for (const p of ['.github/workflows/ci.yml', 'AGENTS.md', 'CLAUDE.md', '.ops.yml', 'docs/vision.md', 'docs/features.json', 'docs/decisions/0001-x.md', 'specs/reveal.md']) {
     assert.equal(g.classify({ ...base, files: [f(p)] }).risk, 'normal', p);
   }
   assert.equal(g.classify({ ...base, files: [f('src/app.ts'), f('README.md')] }).risk, 'normal');
@@ -229,6 +229,28 @@ test('renames are judged on both the old and the new path (Codex P1)', () => {
   // docs tier: code renamed into docs is not a docs change
   assert.equal(g.classify({ ...base, files: [ren('src/x.ts', 'docs/x.md')] }).risk, 'normal');
   assert.equal(g.classify({ ...base, files: [ren('docs/a.md', 'docs/b.md')] }).risk, 'low');
+});
+
+test('docs/features.json is protected: added, modified, removed, renamed, or alongside an agent-safe change (#17)', () => {
+  const FJ = 'docs/features.json';
+  const ren = (from, to) => f(to, '+x', { status: 'renamed', previous_filename: from });
+  for (const status of ['added', 'modified', 'removed']) {
+    const r = g.classify({ ...base, files: [f(FJ, '+x', { status })] });
+    assert.equal(r.risk, 'normal', status);
+    assert.deepEqual(r.reasons, [`protected path ${FJ}`], status);
+  }
+  assert.equal(g.classify({ ...base, files: [ren('docs/checklist.json', FJ)] }).risk, 'normal');
+  assert.equal(g.classify({ ...base, files: [ren(FJ, 'docs/old-features.json')] }).risk, 'normal');
+  assert.equal(g.classify({ ...base, files: [ren(FJ, 'docs/old-features.json')] }).reasons[0], `protected path ${FJ}`);
+  // an agent PR that is otherwise risk:agent
+  assert.equal(g.classify({ ...agentPr, files: [...agentPr.files, f(FJ)] }).risk, 'normal');
+  assert.equal(descOf({ files: [...agentPr.files, f(FJ)] }), `${WAIT} — protected path ${FJ}`);
+  // other files under docs/ are unchanged
+  assert.equal(g.classify({ ...base, files: [f('docs/guide.md'), f('docs/data.json')] }).risk, 'low');
+  assert.equal(g.classify({ ...base, files: [f('docs/features.json.bak')] }).risk, 'low');
+  assert.equal(g.classify({ ...base, files: [f('docs/sub/features.json')] }).risk, 'low');
+  assert.equal(g.classify({ ...base, files: [f('docs/guide.md', '', { status: 'removed' })] }).risk, 'normal');
+  assert.equal(g.classify({ ...agentPr, files: [...agentPr.files, f('docs/guide.md')] }).risk, 'agent');
 });
 
 // ---- second review for Codex PRs (portfolio-ops decision 0006) ------------
