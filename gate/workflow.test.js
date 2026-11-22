@@ -119,6 +119,14 @@ test('workflow: docs PR with a clean Codex review passes and is labelled risk:lo
   assert.deepEqual(h.added, ['risk:low']);
 });
 
+test('workflow: a PR touching only docs/features.json is risk:normal and waits for approval (#17)', async () => {
+  const h = harness({ files: [{ filename: 'docs/features.json', status: 'modified', patch: '+x', additions: 1 }], comments: [codexComment('H')] });
+  await h.run();
+  assert.equal(h.gate().state, 'pending');
+  assert.equal(h.gate().description, 'risk:normal: waiting for human-approved \u2014 protected path docs/features.json');
+  assert.deepEqual(h.added, ['risk:normal']);
+});
+
 test('workflow: Codex findings on the head block; running review waits', async () => {
   const blocked = harness({ comments: [codexComment('H', true)] });
   await blocked.run();
