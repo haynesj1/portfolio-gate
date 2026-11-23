@@ -1181,21 +1181,82 @@ test('#21 markers: the newest verdict wins; ties and unknown times are unclear',
   assert.equal(c(checkV('H', 'pass', at('10:00')), checkV('OLD', 'fail', at('11:00'))), 'pass');
 });
 
-test('#21 markers: a marker inside a quote, code or a second marker in the same comment does not count', () => {
-  const M = '<!-- check-verdict:v1 {"commit_sha":"H","result":"pass"} -->';
-  const c = (body, author = OWNER) => g.checkVerdict({ ...sensitivePr, feedback: [checkV('H', 'pass', { author, body })] });
-  assert.equal(c(`Checked.\n\n${M}\n`), 'pass');
+const M = '<!-- check-verdict:v1 {"commit_sha":"H","result":"pass"} -->';
+const RM = '<!-- ruling-verdict:v1 {"commit_sha":"H","result":"none-stand"} -->';
+const BT = '`';
+// The check verdict read from one comment by the owner's account.
+const checkOf = (body, author = OWNER) => g.checkVerdict({ ...sensitivePr, feedback: [checkV('H', 'pass', { author, body })] });
+// The ruling read from one comment: the same markerLine path.
+const rulingOf = (body) => g.decide({ ...base, feedback: [codex('H', true), ...sixAnswered, rulingV('H', 'none-stand', { body })] }).ruling;
+// Each body must carry no marker, for both kinds, and must not pass a reviewed risk:checked PR.
+const noMarker = (body, why) => {
+  assert.equal(checkOf(body), null, `check: ${why}`);
+  // the same body as a ruling (every check marker renamed): must carry none either
+  assert.equal(rulingOf(body.split(M).join(RM).split('check-verdict:v1').join('ruling-verdict:v1')), null, `ruling: ${why}`);
+  expectState(withFb(sensitivePr, checkV('H', 'pass', { author: OWNER, body })), 'pending', CK('waiting for the check of this commit'));
+};
+
+test('#21 markers: a plain comment with the marker alone on its line counts (check and ruling)', () => {
+  const body = `Checked against the issue: \`npm test\` passes and the ${BT}login${BT} flow is covered.\n\n${M}\n\nThanks.`;
+  assert.equal(checkOf(body), 'pass');
+  assert.equal(rulingOf(body.split(M).join(RM)), 'none-stand');
+  expectState(withFb(sensitivePr, checkV('H', 'pass', { author: OWNER, body })), 'success', CK('check passed and reviewed'));
+  // up to three leading spaces and trailing whitespace are fine; CRLF too
+  assert.equal(checkOf(`   ${M}  \t`), 'pass');
+  assert.equal(checkOf(`Done.\r\n\r\n${M}\r\n`), 'pass');
+  assert.equal(checkOf(`${BT.repeat(3)}\nold: x\n${BT.repeat(3)}\n${M}`), 'pass'); // a closed fence ends
+  assert.equal(checkOf(`> quoted text\n\n${M}`), 'pass'); // a blank line ends the quote
+  assert.equal(checkOf(`<!-- note -->\n${M}`), 'pass'); // a closed HTML comment before it
+});
+
+test('#21 markers: Codex reproduction, an inline code span over several lines, does not pass the PR', () => {
+  const repro = `${BT}\nexample ${M}\n${BT}`;
+  noMarker(repro, 'codex reproduction');
+  // the marker alone on its line, still inside the span
+  noMarker(`${BT}\n${M}\n${BT}`, 'alone inside a one-backtick span');
+  noMarker(`Text ${BT.repeat(2)} starts\n${M}\nends ${BT.repeat(2)} here`, 'inside a two-backtick span');
+  // a run of a different length does not close the span
+  noMarker(`${BT.repeat(2)}\n${BT}\n${M}\n${BT.repeat(2)}`, 'one backtick inside a two-backtick span');
+});
+
+test('#21 markers: an open or ambiguous code span means the comment carries no marker', () => {
+  noMarker(`${M}\nSee ${BT}this`, 'span open at the end, after the marker');
+  noMarker(`Open ${BT}span\n\n${M}`, 'span open at a blank line');
+  noMarker(`Open ${BT.repeat(2)} span\n${M}`, 'span open at the end, before the marker');
+  noMarker(`${BT.repeat(3)}\n${M}`, 'unclosed fence');
+  noMarker(`${BT.repeat(4)}\n${BT.repeat(3)}\n${M}\n${BT.repeat(3)}\n`, 'shorter fence inside a longer one');
+  noMarker(`~~~md\n${M}\n~~~`, 'tilde fence');
+});
+
+test('#21 markers: a marker counts only alone on its line', () => {
   for (const body of [
-    `> ${M}`, `Earlier:\n>${M}\n`, `  > > ${M}`,
-    `\`\`\`\n${M}\n\`\`\``, `~~~md\n${M}\n~~~`, `\`\`\`\n${M}`, `\`\`\`\`\n\`\`\`\n${M}\n\`\`\`\n`,
-    `    ${M}`, `\t${M}`, `\`${M}\``, `Like this: \`\` ${M} \`\``,
+    `example ${M}`, `${M} done`, `${M}${M.replace('pass', 'fail')}`, `<!-- x --> ${M}`, `${BT}${M}${BT}`,
+    `- ${M}`, `* ${M}`, `1. ${M}`, `# ${M}`, `| ${M} |`, `**${M}**`,
+    `    ${M}`, `\t${M}`,
+    M.replace('-->', ''), `<!-- check-verdict:v1 {"commit_sha":"H","result":"pass","x":"-->"} -->`,
     `${M}\n${M.replace('pass', 'fail')}`, `${M}\nFor reference: check-verdict:v1`,
-  ]) assert.equal(c(body), null, body);
-  // a closed fence ends: a real marker after it counts
-  assert.equal(c(`\`\`\`\nold: x\n\`\`\`\n${M}`), 'pass');
-  // the same quote from github-actions[bot] does not count either
-  assert.equal(c(`> ${M}`, ACTIONS_BOT), null);
-  assert.equal(g.unquotedText(`a\n> b\n\`\`\`\nc\n\`\`\`\nd`), 'a\nd');
+  ]) noMarker(body, body);
+});
+
+test('#21 markers: quotes, HTML comments, <pre>/<code> and list code never carry a marker', () => {
+  // block quotes, including a lazy continuation line with no `>`
+  noMarker(`> ${M}`, 'quote');
+  noMarker(`  > > ${M}`, 'nested quote');
+  noMarker(`> Earlier result:\n${M}`, 'lazy quote continuation');
+  noMarker(`> Earlier result:\nand more\n${M}\n`, 'lazy quote continuation, third line');
+  // an HTML comment that wraps the marker, on one line or several
+  noMarker(`<!-- note ${M} -->`, 'wrapped on one line');
+  noMarker(`<!--\n${M}\n-->`, 'wrapped over lines');
+  noMarker(`<!-- old notes\n\n${M}\n-->`, 'wrapped across a blank line');
+  // raw <pre> or <code> HTML, over several lines (any such tag: none)
+  noMarker(`<pre>\n${M}\n</pre>`, 'pre');
+  noMarker(`<code>\n${M}\n</code>`, 'code');
+  noMarker(`<PRE class="x">\n\n${M}\n\n</PRE>`, 'pre with blank lines');
+  noMarker(`Result:\n\n${M}\n\n<details><pre>log</pre></details>`, 'pre anywhere in the comment');
+  // indented code after a list item
+  noMarker(`- item\n\n      ${M}`, 'indented code in a list item');
+  noMarker(`1. item\n\n        ${M}`, 'indented code in an ordered list item');
+  noMarker(`- item\n    ${M}`, 'list continuation indented four');
 });
 
 test('#21 rulings: none-stand lets answered findings proceed by their own tier', () => {

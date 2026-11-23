@@ -581,31 +581,61 @@ jobs:
               // for the existing Codex second review (secondReview).
               //
               // A marker counts only in a PR conversation comment (kind 'comment') by one of
-              // those two accounts, bound to the head commit, outside block quotes and code,
-              // and only when that comment carries exactly one marker of its kind. JSON that
-              // does not parse, is not an object, or has no string commit_sha counts as none.
-              // A result outside the listed values counts as `unclear`.
+              // those two accounts, bound to the head commit, and only when markerLine finds
+              // it alone on its own line in plain text (see there). JSON that does not parse,
+              // is not an object, or has no string commit_sha counts as none. A result
+              // outside the listed values counts as `unclear`.
               const VERDICT_MARKERS = {
-                check: { name: 'check-verdict:v1', re: /<!--\s*check-verdict:v1\s*(\{[\s\S]*?\})\s*-->/, results: ['pass', 'fail', 'unclear'] },
-                ruling: { name: 'ruling-verdict:v1', re: /<!--\s*ruling-verdict:v1\s*(\{[\s\S]*?\})\s*-->/, results: ['none-stand', 'stands', 'unclear'] },
+                check: { name: 'check-verdict:v1', re: /<!--\s*check-verdict:v1\s*(\{[\s\S]*?\})\s*-->/, line: /^ {0,3}<!--\s*check-verdict:v1\s*\{[^{}]*\}\s*-->\s*$/, results: ['pass', 'fail', 'unclear'] },
+                ruling: { name: 'ruling-verdict:v1', re: /<!--\s*ruling-verdict:v1\s*(\{[\s\S]*?\})\s*-->/, line: /^ {0,3}<!--\s*ruling-verdict:v1\s*\{[^{}]*\}\s*-->\s*$/, results: ['none-stand', 'stands', 'unclear'] },
               };
-              // The text of a comment without its block quotes, fenced or indented code, or
-              // any line with a backtick (inline code), so a quoted or pasted marker is never
-              // read as a verdict. An unclosed fence hides the rest of the comment.
-              function unquotedText(body) {
-                const out = [];
-                let fence = null;
-                for (const line of String(body || '').split(/\r\n?|\n/)) {
-                  const open = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+              // Raw HTML whose content Markdown does not render as plain text. Correct
+              // handling is not simple, so a comment containing any of these carries no marker.
+              const RAW_HTML_TEXT = /<\s*\/?\s*(pre|code|textarea|xmp|plaintext|listing|script|style|kbd|samp|tt)\b/i;
+              // The one marker line of `spec` in a comment, or null. Fail closed: the comment
+              // carries no marker unless ALL of these hold.
+              //  - The marker name occurs exactly once in the whole comment.
+              //  - The comment has no raw <pre>, <code> or similar HTML (RAW_HTML_TEXT).
+              //  - That occurrence is alone on its line: at most three leading spaces (four,
+              //    or a tab, is indented code, also after a list item), one HTML comment
+              //    holding the marker and its JSON, then only whitespace.
+              //  - The line is not in a fenced code block, a block quote (a `>` line and its
+              //    lazy continuation lines up to the next blank line), an inline code span, or
+              //    an HTML comment opened earlier and not yet closed.
+              //  - Code-span state is never ambiguous: a run of n backticks opens a span that
+              //    ends only at the next run of exactly n, possibly on a later line; a span
+              //    still open at a blank line or at the end, or an unclosed fence, means the
+              //    comment carries no marker.
+              function markerLine(body, spec) {
+                const text = String(body || '');
+                if (occurrences(text, spec.name) !== 1 || RAW_HTML_TEXT.test(text)) return null;
+                let fence = null; let span = 0; let quote = false; let html = false; let found = null;
+                for (const line of text.split(/\r\n?|\n/)) {
                   if (fence) {
-                    if (open && open[1][0] === fence[0] && open[1].length >= fence.length && /^ {0,3}(`+|~+)\s*$/.test(line)) fence = null;
+                    if (/^ {0,3}(`+|~+)\s*$/.test(line) && line.trim()[0] === fence[0] && line.trim().length >= fence.length) fence = null;
                     continue;
                   }
-                  if (open) { fence = open[1]; continue; }
-                  if (/^\s*>/.test(line) || /^( {4}|\t)/.test(line) || line.includes('`')) continue;
-                  out.push(line);
+                  if (/^\s*$/.test(line)) { if (span) return null; quote = false; continue; }
+                  if (!span) {
+                    const open = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+                    if (open) { fence = open[1]; continue; }
+                    if (/^ {0,3}>/.test(line)) { quote = true; continue; }
+                    if (quote) continue; // lazy continuation of the quote paragraph
+                    if (line.includes(spec.name)) {
+                      if (html || !spec.line.test(line) || occurrences(line, '<!--') !== 1 || occurrences(line, '-->') !== 1) return null;
+                      found = line;
+                      continue;
+                    }
+                  }
+                  for (const run of line.match(/`+/g) || []) {
+                    if (!span) span = run.length;
+                    else if (run.length === span) span = 0;
+                  }
+                  // Comment openers and closers, in order (naive about code spans: a stray
+                  // opener can only make a later marker count as none).
+                  for (const tok of line.match(/<!--|-->/g) || []) html = tok === '<!--';
                 }
-                return out.join('\n');
+                return fence || span ? null : found;
               }
               // Every counted marker of `kind` for the head: [{ result, at }] (at in ms, NaN if unknown).
               function verdictMarkers({ feedback, headSha, owner }, kind) {
@@ -615,9 +645,9 @@ jobs:
                 for (const x of feedback || []) {
                   if (x?.kind !== 'comment') continue;
                   if (x.author !== ACTIONS_BOT && !(owner && x.author === owner)) continue;
-                  const text = unquotedText(x.body);
-                  if (occurrences(text, spec.name) !== 1) continue;
-                  const v = parse(spec.re, text);
+                  const line = markerLine(x.body, spec);
+                  if (!line) continue;
+                  const v = parse(spec.re, line);
                   if (!isPlainObject(v) || typeof v.commit_sha !== 'string' || v.commit_sha !== headSha) continue;
                   found.push({ result: spec.results.includes(v.result) ? v.result : 'unclear', at: timeOf(x.updatedAt || x.createdAt) });
                 }
@@ -748,7 +778,7 @@ jobs:
                 return { risk, reasons, agentWhy, review, secondReview: second, overridden, approved, check, ruling: ruling?.result ?? null, settled, state, description };
               }
 
-              module.exports = { checkVerdict, rulingVerdict, rulingCovers, unquotedText, CHECKABLE_REASONS, approvedListError, approvedCopyPlan, approvedCopy, decodeContent, copyHash, ACTIONS_BOT, codexFindingsAnswered, secondReview, pathsOf, countTestLines, countPrTestLines, REMOVED_TEST_LINE, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
+              module.exports = { checkVerdict, rulingVerdict, rulingCovers, markerLine, VERDICT_MARKERS, CHECKABLE_REASONS, approvedListError, approvedCopyPlan, approvedCopy, decodeContent, copyHash, ACTIONS_BOT, codexFindingsAnswered, secondReview, pathsOf, countTestLines, countPrTestLines, REMOVED_TEST_LINE, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
 
               return module.exports; })();
             // Approved copies (issue #19): embedded from gate/approved-copies.json at build time.
