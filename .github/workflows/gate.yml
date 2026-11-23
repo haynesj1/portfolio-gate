@@ -609,7 +609,7 @@ jobs:
 
               return module.exports; })();
             // Approved copies (issue #19): embedded from gate/approved-copies.json at build time.
-            const APPROVED_COPIES = {"files":[{"path":".github/workflows/pr-gate.yml","sha256":["b1fcaef2cf084d3c69c25ed4a3ddf234cbe47d44aa3f14cab9b2ce8a461c6005"]}],"blocks":[]};
+            const APPROVED_COPIES = {"files":[{"path":".github/workflows/pr-gate.yml","sha256":["b1fcaef2cf084d3c69c25ed4a3ddf234cbe47d44aa3f14cab9b2ce8a461c6005"]}],"blocks":[{"path":"AGENTS.md","start":"<!-- portfolio-ops:common:start -->","end":"<!-- portfolio-ops:common:end -->","sha256":["44c98b1b8251c9ae802aeafdc5b731e5f8a046e09bc5709f2f4e085cb28b3846"]}]};
             const copyReads = new Map(); // `${sha}:${path}` -> decoded text or null, for this run
             const { owner, repo } = context.repo;
             // Reads every input the gate decides on, fresh from GitHub.

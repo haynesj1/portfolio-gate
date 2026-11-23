@@ -952,9 +952,9 @@ test('approved copies: content reads decode only a whole UTF-8 file at exactly t
   assert.equal(g.decodeContent(resp(CALLER_TEXT, { content: '!!not base64!!' }), COPY), null);
 });
 
-test('approved copies: the shipped list has the caller entry and no block entries', () => {
+test('approved copies: the shipped list has the caller entry and the shared AGENTS.md block entry', () => {
   const shipped = JSON.parse(require('node:fs').readFileSync(require('node:path').join(__dirname, 'approved-copies.json'), 'utf8'));
   assert.equal(g.approvedListError(shipped), null);
   assert.deepEqual(shipped.files.map((e) => e.path), [COPY]);
-  assert.deepEqual(shipped.blocks, []);
+  assert.deepEqual(shipped.blocks.map((e) => e.path), ['AGENTS.md']);
 });
