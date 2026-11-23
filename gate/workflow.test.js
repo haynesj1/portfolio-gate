@@ -198,6 +198,14 @@ test('caller comment filter: review results evaluate, other comments are skipped
   assert.equal(onComment('<!-- ruling-verdict:v1 {"commit_sha":"abc","result":"none-stand"} -->'), true);
   assert.equal(onComment('Withdrawn.', true, '<!-- check-verdict:v1 {"commit_sha":"abc","result":"pass"} -->'), true);
   assert.equal(onComment('Withdrawn.', true, '<!-- ruling-verdict:v1 {"commit_sha":"abc","result":"stands"} -->'), true);
+  // A deleted comment: the payload still carries its body, so deleting a verdict evaluates (#21).
+  const onDelete = (body) => run({ event_name: 'issue_comment', event: { action: 'deleted', issue: { pull_request: { url: 'x' } }, comment: { body } } });
+  assert.equal(onDelete('<!-- check-verdict:v1 {"commit_sha":"abc","result":"pass"} -->'), true);
+  assert.equal(onDelete('<!-- ruling-verdict:v1 {"commit_sha":"abc","result":"none-stand"} -->'), true);
+  assert.equal(onDelete('<!-- review-verdict:v1 {"commit_sha":"abc","result":"clear"} -->'), true);
+  assert.equal(onDelete('Thanks, fixed.'), false);
+  const types = /issue_comment:\n(?:\s+#.*\n)*\s+types: \[([^\]]*)\]/.exec(callerYml)[1].split(/,\s*/);
+  assert.deepEqual(types, ['created', 'edited', 'deleted']);
   // Ordinary comments, PR summaries and comments on plain issues are skipped.
   assert.equal(onComment('Fixed in the latest push.'), false);
   assert.equal(onComment('<!-- pr-summary:v1 -->\n## Summary for the owner'), false);
@@ -477,7 +485,7 @@ test('workflow: no content is read unless every changed file is a listed path (#
 const SENS_OPS = 'agent_safe: true\nsensitive_paths:\n  - "src/auth/**"\n';
 const sensFiles = [{ filename: 'src/auth/login.ts', status: 'modified', patch: '+x', additions: 1 }];
 const verdict = (kind, sha, result, login = 'github-actions[bot]', at = '2026-11-06T11:00:00Z') => ({ user: { login }, created_at: at, updated_at: at,
-  body: `Result below.\n<!-- ${kind}-verdict:v1 {"commit_sha":"${sha}","result":"${result}"} -->` });
+  body: `<!-- ${kind}-verdict:v1 {"commit_sha":"${sha}","result":"${result}"} -->\nResult above.` });
 const checkedPr = (extra = {}) => harness({ headRef: 'claude/7', ops: SENS_OPS, issue: { number: 7, state: 'open', labels: [{ name: 'ready' }] }, files: sensFiles,
   runs: [run('H', '2026-11-06T09:00:00Z')], labels: ['risk:normal'], ...extra });
 
@@ -550,4 +558,27 @@ test('workflow: a none-stand ruling lets an answered checked PR proceed to its c
   await stands.run();
   assert.equal(stands.gate().state, 'failure');
   assert.equal(stands.gate().description, 'Ruling for this commit: a reviewer finding stands');
+});
+
+test('workflow: deleting the passing check verdict withdraws the pass (#21)', async () => {
+  const passed = checkedPr({ comments: [codexComment('H'), verdict('check', 'H', 'pass')] });
+  await passed.run();
+  assert.equal(passed.gate().state, 'success');
+  // The comment is deleted: the deleted event runs the gate, which no longer lists it.
+  const gone = checkedPr({ event: 'issue_comment', action: 'deleted', comments: [codexComment('H')] });
+  await gone.run();
+  assert.equal(gone.gate().state, 'pending');
+  assert.equal(gone.gate().description, 'risk:checked: waiting for the check of this commit — sensitive path src/auth/login.ts');
+  // the same for a covering ruling: the answered PR goes back to waiting for human-approved
+  const codexBot = { login: 'chatgpt-codex-connector[bot]' };
+  const reviewComments = [
+    { id: 1, user: codexBot, body: '![P1 Badge](https://img.shields.io/badge/P1-orange) problem', commit_id: 'H', original_commit_id: 'C1', created_at: '2026-11-06T09:00:00Z' },
+    { id: 101, in_reply_to_id: 1, user: { login: OWNER }, body: 'Fixed in C3.', commit_id: 'H', original_commit_id: 'C3', created_at: '2026-11-06T09:30:00Z' },
+  ];
+  const ruled = checkedPr({ comments: [codexComment('H', true), verdict('ruling', 'H', 'none-stand'), verdict('check', 'H', 'pass')], reviewComments });
+  await ruled.run();
+  assert.equal(ruled.gate().state, 'success');
+  const unruled = checkedPr({ event: 'issue_comment', action: 'deleted', comments: [codexComment('H', true), verdict('check', 'H', 'pass')], reviewComments });
+  await unruled.run();
+  assert.equal(unruled.gate().description, 'risk:checked: waiting for human-approved — reviewer findings answered, not resolved — sensitive path src/auth/login.ts');
 });

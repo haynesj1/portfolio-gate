@@ -12,8 +12,9 @@ on:
   pull_request_target:
     # edited: the PR body can carry the linked issue (`Closes #n`) for the agent-safe tier.
     types: [opened, edited, synchronize, reopened, labeled, unlabeled, ready_for_review, converted_to_draft]
+  # deleted: removing the comment that carried a verdict must withdraw its pass.
   issue_comment:
-    types: [created, edited]
+    types: [created, edited, deleted]
   # The agent-safe tier depends on the linked issue (open, queued, not pivotal),
   # so changes to it re-evaluate the PRs that implement it.
   issues:
@@ -49,7 +50,9 @@ jobs:
     # body, no base branch) and the author is not Dependabot, whose title the gate
     # reads. Any other edit evaluates, including a body edit from an empty body.
     # An edit that removes a review result also evaluates (the previous
-    # body is checked too), so withdrawn evidence is recomputed at once.
+    # body is checked too), and so does deleting a comment that carried one
+    # (a deleted event's payload still holds the comment body), so withdrawn
+    # evidence is recomputed at once.
     # Issue events evaluate only when they can change the agent-safe tier: the
     # issue closed or reopened, or its ready / in-progress / pivotal label changed.
     # Tested in gate/workflow.test.js ("caller comment filter" and "caller PR filter").

@@ -1196,17 +1196,39 @@ const noMarker = (body, why) => {
   expectState(withFb(sensitivePr, checkV('H', 'pass', { author: OWNER, body })), 'pending', CK('waiting for the check of this commit'));
 };
 
-test('#21 markers: a plain comment with the marker alone on its line counts (check and ruling)', () => {
-  const body = `Checked against the issue: \`npm test\` passes and the ${BT}login${BT} flow is covered.\n\n${M}\n\nThanks.`;
+test('#21 markers: the marker on the first line, alone, counts whatever follows (check and ruling)', () => {
+  const body = `${M}\n\nChecked against the issue: \`npm test\` passes and the ${BT}login${BT} flow is covered.\n\n- one\n- two\n\n${BT.repeat(3)}\nlog\n${BT.repeat(3)}\n\n> quoted\n<pre>x</pre>\nSee ${BT}this`;
   assert.equal(checkOf(body), 'pass');
   assert.equal(rulingOf(body.split(M).join(RM)), 'none-stand');
   expectState(withFb(sensitivePr, checkV('H', 'pass', { author: OWNER, body })), 'success', CK('check passed and reviewed'));
-  // up to three leading spaces and trailing whitespace are fine; CRLF too
-  assert.equal(checkOf(`   ${M}  \t`), 'pass');
-  assert.equal(checkOf(`Done.\r\n\r\n${M}\r\n`), 'pass');
-  assert.equal(checkOf(`${BT.repeat(3)}\nold: x\n${BT.repeat(3)}\n${M}`), 'pass'); // a closed fence ends
-  assert.equal(checkOf(`> quoted text\n\n${M}`), 'pass'); // a blank line ends the quote
-  assert.equal(checkOf(`<!-- note -->\n${M}`), 'pass'); // a closed HTML comment before it
+  expectState({ ...base, feedback: [codex('H', true), ...sixAnswered, rulingV('H', 'none-stand', { body: body.split(M).join(RM) })] }, 'pending', `${WAIT} — ${NO_TIER}`);
+  // up to three leading spaces and trailing spaces or tabs; CRLF; a leading byte-order mark; the marker as the whole body
+  for (const b of [`   ${M}  \t`, `${M}\r\nDone.\r\n`, `${M}\rDone.`, `﻿${M}\nDone.`, M, '<!--check-verdict:v1{"commit_sha":"H","result":"pass"}-->']) {
+    assert.equal(checkOf(b), 'pass', JSON.stringify(b));
+    assert.equal(rulingOf(b.split(M).join(RM).split('check-verdict:v1').join('ruling-verdict:v1').replace('"pass"', '"none-stand"')), 'none-stand', JSON.stringify(b));
+  }
+});
+
+test('#21 markers: a marker anywhere but the first line carries nothing', () => {
+  noMarker(`\n${M}`, 'leading blank line');
+  noMarker(`\r\n${M}`, 'leading blank CRLF line');
+  noMarker(` \n${M}`, 'leading whitespace-only line');
+  noMarker(`Checked.\n\n${M}`, 'after prose');
+  noMarker(`Done.\r\n\r\n${M}\r\n`, 'after prose, CRLF');
+  noMarker(`<!-- note -->\n${M}`, 'after a closed HTML comment');
+  noMarker(`> quoted text\n\n${M}`, 'after a quote');
+  noMarker(`${BT.repeat(3)}\nold: x\n${BT.repeat(3)}\n${M}`, 'after a closed fence');
+  noMarker(`﻿﻿${M}`, 'two byte-order marks');
+  noMarker(` ${M}`, 'a non-breaking space before it');
+});
+
+test('#21 markers: Codex reproduction, a fence inside a list item, does not pass the PR (check and ruling)', () => {
+  const repro = (marker) => `- ~~~\n${marker}\n    ~~~`;
+  noMarker(repro(M), 'list fence');
+  // the ruling: an answered risk:checked PR with a passing check stays waiting for human-approved
+  const checkedAnswered = { ...sensitivePr, feedback: [codex('H', true), ...sixAnswered, checkV('H', 'pass'), rulingV('H', 'none-stand', { body: repro(RM) })] };
+  expectState(checkedAnswered, 'pending', CK('waiting for human-approved — reviewer findings answered, not resolved'));
+  assert.equal(g.decide(checkedAnswered).ruling, null);
 });
 
 test('#21 markers: Codex reproduction, an inline code span over several lines, does not pass the PR', () => {
@@ -1219,8 +1241,7 @@ test('#21 markers: Codex reproduction, an inline code span over several lines, d
   noMarker(`${BT.repeat(2)}\n${BT}\n${M}\n${BT.repeat(2)}`, 'one backtick inside a two-backtick span');
 });
 
-test('#21 markers: an open or ambiguous code span means the comment carries no marker', () => {
-  noMarker(`${M}\nSee ${BT}this`, 'span open at the end, after the marker');
+test('#21 markers: a marker in or after an open or ambiguous code span carries nothing', () => {
   noMarker(`Open ${BT}span\n\n${M}`, 'span open at a blank line');
   noMarker(`Open ${BT.repeat(2)} span\n${M}`, 'span open at the end, before the marker');
   noMarker(`${BT.repeat(3)}\n${M}`, 'unclosed fence');

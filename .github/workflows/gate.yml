@@ -581,61 +581,28 @@ jobs:
               // for the existing Codex second review (secondReview).
               //
               // A marker counts only in a PR conversation comment (kind 'comment') by one of
-              // those two accounts, bound to the head commit, and only when markerLine finds
-              // it alone on its own line in plain text (see there). JSON that does not parse,
-              // is not an object, or has no string commit_sha counts as none. A result
-              // outside the listed values counts as `unclear`.
+              // those two accounts, bound to the head commit, and only on the comment's first
+              // line (markerLine). JSON that does not parse, is not an object, or has no
+              // string commit_sha counts as none. A result outside the listed values counts
+              // as `unclear`.
               const VERDICT_MARKERS = {
-                check: { name: 'check-verdict:v1', re: /<!--\s*check-verdict:v1\s*(\{[\s\S]*?\})\s*-->/, line: /^ {0,3}<!--\s*check-verdict:v1\s*\{[^{}]*\}\s*-->\s*$/, results: ['pass', 'fail', 'unclear'] },
-                ruling: { name: 'ruling-verdict:v1', re: /<!--\s*ruling-verdict:v1\s*(\{[\s\S]*?\})\s*-->/, line: /^ {0,3}<!--\s*ruling-verdict:v1\s*\{[^{}]*\}\s*-->\s*$/, results: ['none-stand', 'stands', 'unclear'] },
+                check: { name: 'check-verdict:v1', re: /<!--\s*check-verdict:v1\s*(\{[\s\S]*?\})\s*-->/, line: /^ {0,3}<!--[ \t]*check-verdict:v1[ \t]*\{[^{}]*\}[ \t]*-->[ \t]*$/, results: ['pass', 'fail', 'unclear'] },
+                ruling: { name: 'ruling-verdict:v1', re: /<!--\s*ruling-verdict:v1\s*(\{[\s\S]*?\})\s*-->/, line: /^ {0,3}<!--[ \t]*ruling-verdict:v1[ \t]*\{[^{}]*\}[ \t]*-->[ \t]*$/, results: ['none-stand', 'stands', 'unclear'] },
               };
-              // Raw HTML whose content Markdown does not render as plain text. Correct
-              // handling is not simple, so a comment containing any of these carries no marker.
-              const RAW_HTML_TEXT = /<\s*\/?\s*(pre|code|textarea|xmp|plaintext|listing|script|style|kbd|samp|tt)\b/i;
-              // The one marker line of `spec` in a comment, or null. Fail closed: the comment
-              // carries no marker unless ALL of these hold.
-              //  - The marker name occurs exactly once in the whole comment.
-              //  - The comment has no raw <pre>, <code> or similar HTML (RAW_HTML_TEXT).
-              //  - That occurrence is alone on its line: at most three leading spaces (four,
-              //    or a tab, is indented code, also after a list item), one HTML comment
-              //    holding the marker and its JSON, then only whitespace.
-              //  - The line is not in a fenced code block, a block quote (a `>` line and its
-              //    lazy continuation lines up to the next blank line), an inline code span, or
-              //    an HTML comment opened earlier and not yet closed.
-              //  - Code-span state is never ambiguous: a run of n backticks opens a span that
-              //    ends only at the next run of exactly n, possibly on a later line; a span
-              //    still open at a blank line or at the end, or an unclosed fence, means the
-              //    comment carries no marker.
+              // The marker line of `spec` in a comment, or null. Positional, so no Markdown
+              // parsing is needed: the marker counts only as the comment's FIRST line (after a
+              // leading byte-order mark), alone: at most three spaces, the one HTML comment
+              // holding the marker name and its JSON, then only spaces or tabs. Nothing can
+              // open before the first line, so no list, fence, quote, code span or HTML
+              // comment can enclose it. The marker name must also occur nowhere else in the
+              // comment, and the line must hold exactly one `<!--` and one `-->` (so the JSON
+              // has no `-->` inside it).
               function markerLine(body, spec) {
-                const text = String(body || '');
-                if (occurrences(text, spec.name) !== 1 || RAW_HTML_TEXT.test(text)) return null;
-                let fence = null; let span = 0; let quote = false; let html = false; let found = null;
-                for (const line of text.split(/\r\n?|\n/)) {
-                  if (fence) {
-                    if (/^ {0,3}(`+|~+)\s*$/.test(line) && line.trim()[0] === fence[0] && line.trim().length >= fence.length) fence = null;
-                    continue;
-                  }
-                  if (/^\s*$/.test(line)) { if (span) return null; quote = false; continue; }
-                  if (!span) {
-                    const open = /^ {0,3}(`{3,}|~{3,})/.exec(line);
-                    if (open) { fence = open[1]; continue; }
-                    if (/^ {0,3}>/.test(line)) { quote = true; continue; }
-                    if (quote) continue; // lazy continuation of the quote paragraph
-                    if (line.includes(spec.name)) {
-                      if (html || !spec.line.test(line) || occurrences(line, '<!--') !== 1 || occurrences(line, '-->') !== 1) return null;
-                      found = line;
-                      continue;
-                    }
-                  }
-                  for (const run of line.match(/`+/g) || []) {
-                    if (!span) span = run.length;
-                    else if (run.length === span) span = 0;
-                  }
-                  // Comment openers and closers, in order (naive about code spans: a stray
-                  // opener can only make a later marker count as none).
-                  for (const tok of line.match(/<!--|-->/g) || []) html = tok === '<!--';
-                }
-                return fence || span ? null : found;
+                const text = String(body || '').replace(/^\uFEFF/, '');
+                if (occurrences(text, spec.name) !== 1) return null;
+                const first = text.split(/\r\n|\r|\n/, 1)[0];
+                if (!spec.line.test(first) || occurrences(first, '<!--') !== 1 || occurrences(first, '-->') !== 1) return null;
+                return first;
               }
               // Every counted marker of `kind` for the head: [{ result, at }] (at in ms, NaN if unknown).
               function verdictMarkers({ feedback, headSha, owner }, kind) {
@@ -782,7 +749,7 @@ jobs:
 
               return module.exports; })();
             // Approved copies (issue #19): embedded from gate/approved-copies.json at build time.
-            const APPROVED_COPIES = {"files":[{"path":".github/workflows/pr-gate.yml","sha256":["08cb78a02eeda798e378931690a5f4c1252db478d1f8563cc1763d8c5cebd157"]}],"blocks":[{"path":"AGENTS.md","start":"<!-- portfolio-ops:common:start -->","end":"<!-- portfolio-ops:common:end -->","sha256":["44c98b1b8251c9ae802aeafdc5b731e5f8a046e09bc5709f2f4e085cb28b3846"]}]};
+            const APPROVED_COPIES = {"files":[{"path":".github/workflows/pr-gate.yml","sha256":["409e192d97e416ab7269c5fdb35d934f9d2c9ba63e7cae3c5d3e6eca4e2a2b86"]}],"blocks":[{"path":"AGENTS.md","start":"<!-- portfolio-ops:common:start -->","end":"<!-- portfolio-ops:common:end -->","sha256":["44c98b1b8251c9ae802aeafdc5b731e5f8a046e09bc5709f2f4e085cb28b3846"]}]};
             const copyReads = new Map(); // `${sha}:${path}` -> decoded text or null, for this run
             const { owner, repo } = context.repo;
             // Reads every input the gate decides on, fresh from GitHub.

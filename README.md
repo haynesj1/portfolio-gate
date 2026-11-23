@@ -40,17 +40,9 @@ The check and the ruling sessions are started outside the gate. They post their 
 <!-- ruling-verdict:v1 {"commit_sha":"<head sha>","result":"none-stand"|"stands"|"unclear"} -->
 ```
 
-A marker counts only when it is in a PR conversation comment (not a review or a line comment) written by the repository owner's account or by `github-actions[bot]`, and names the head commit. **Sessions that write verdicts must put the marker alone on its own line**: at most three leading spaces, the one HTML comment, then nothing but whitespace. The gate fails closed on anything else, and the comment then carries no marker at all:
+A marker counts only when it is in a PR conversation comment (not a review or a line comment) written by the repository owner's account or by `github-actions[bot]`, and names the head commit. **Sessions that write verdicts must make the marker the first line of the comment, alone (at most three leading spaces, nothing after it but spaces or tabs), and must not use its name anywhere else in the comment**; anything else carries no marker. Because nothing can open before the first line, no list, fence, quote, code span or HTML comment can hide or fake a marker there, and the gate needs no Markdown parsing. Prose, lists, code and quotes after the first line are fine. The newest counted verdict wins (an edited comment is as new as its edit); verdicts that disagree at the same time, or that cannot be ordered, read as `unclear`. A marker whose JSON does not parse, or has no `commit_sha`, counts as none; a result outside the listed values reads as `unclear`. A new commit clears every verdict.
 
-- any other text on the marker's line (a list bullet, a heading, a second comment, backticks);
-- the marker name appearing more than once anywhere in the comment, including in a quote or in prose;
-- the marker inside a fenced or indented code block (four spaces or a tab, also under a list item), a block quote (including its lazy continuation lines), an inline code span (a run of n backticks opens a span that ends only at the next run of exactly n, on any later line), or an HTML comment opened earlier and not yet closed;
-- an unclosed fence, or a code span still open at a blank line or at the end of the comment;
-- any raw `<pre>`, `<code>`, `<kbd>`, `<samp>`, `<tt>`, `<textarea>`, `<xmp>`, `<listing>`, `<plaintext>`, `<script>` or `<style>` tag anywhere in the comment.
-
-Ordinary prose, single-line inline code and closed fences elsewhere in the comment are fine. The newest counted verdict wins (an edited comment is as new as its edit); verdicts that disagree at the same time, or that cannot be ordered, read as `unclear`. A marker whose JSON does not parse, or has no `commit_sha`, counts as none; a result outside the listed values reads as `unclear`. A new commit clears every verdict.
-
-The caller evaluates the gate when a comment carrying either marker is posted, or edited to remove one; until an app repository has the updated caller, a verdict there is read at the next PR event instead.
+The caller evaluates the gate when a comment carrying either marker is posted, edited to remove one, or deleted (so deleting a passing check or a covering ruling withdraws the pass); until an app repository has the updated caller, a verdict there is read at the next PR event instead.
 
 | `risk:checked`, review clean | Status |
 |---|---|
