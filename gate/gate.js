@@ -88,8 +88,10 @@ function parseOpsPolicy(text) {
   // `key: value`, or an item of the policy list being read. Anything else
   // (quoted or indented keys, nested blocks, stray text) switches the tier off,
   // so syntax this parser doesn't understand can never drop a restriction.
-  const policy = { agentSafe: false, maxLines: 400, sensitive: [], pivotal: [] };
-  const off = (why) => ({ ...policy, agentSafe: false, invalid: why });
+  // checkedTier (issue #21): on unless `checked_tier: false`; it only ever
+  // applies where agentSafe is also true. Once false it stays false.
+  const policy = { agentSafe: false, maxLines: 400, sensitive: [], pivotal: [], checkedTier: true };
+  const off = (why) => ({ ...policy, agentSafe: false, checkedTier: false, invalid: why });
   let list = null;
   for (const raw of String(text || '').split('\n')) {
     if (/^\s*(#.*)?$/.test(raw)) continue;
@@ -101,7 +103,10 @@ function parseOpsPolicy(text) {
     list = null;
     const key = kv[1]; const value = (kv[2] || '').trim();
     if (key === 'agent_safe') policy.agentSafe = value === 'true';
-    else if (key === 'agent_max_lines') { if (!/^\d+$/.test(value)) return off('agent_max_lines is not a number'); policy.maxLines = Number(value); }
+    else if (key === 'checked_tier') {
+      if (value !== 'true' && value !== 'false') return off('checked_tier is not true or false');
+      policy.checkedTier = policy.checkedTier && value === 'true';
+    } else if (key === 'agent_max_lines') { if (!/^\d+$/.test(value)) return off('agent_max_lines is not a number'); policy.maxLines = Number(value); }
     else if (key === 'sensitive_paths' || key === 'pivotal_paths') {
       const name = key === 'sensitive_paths' ? 'sensitive' : 'pivotal';
       const inline = /^\[(.*)\]$/.exec(value);
@@ -176,32 +181,39 @@ function countPrTestLines(files) {
   return total;
 }
 
-// Returns { ok, why }. `issue` is { state, labels } of the linked issue or null.
+// Returns { ok, why, reasons }. `issue` is { state, labels } of the linked issue
+// or null. `reasons` lists EVERY rule the PR fails as { code, why } (the
+// checked tier needs all of them); `why` is the first, the one the status names.
+// The repo, branch and issue rules stop at the first failure: none of them is
+// a reason the checked tier accepts, so nothing after them can matter.
 function agentSafe({ headRef, files, policy, issue }) {
-  if (!policy?.agentSafe) return { ok: false, why: 'agent-safe tier not enabled for this repo' };
-  if (!/^(claude|codex)\//.test(headRef || '')) return { ok: false, why: 'not an agent branch' };
-  if (!issue) return { ok: false, why: 'no linked issue' };
-  if (issue.state !== 'open') return { ok: false, why: 'linked issue is not open' };
-  if (!issue.labels.includes('ready') && !issue.labels.includes('in-progress')) return { ok: false, why: 'linked issue was not queued (ready)' };
-  if (issue.labels.includes('pivotal')) return { ok: false, why: 'linked issue is pivotal' };
+  const no = (code, why) => ({ ok: false, why, reasons: [{ code, why }] });
+  if (!policy?.agentSafe) return no('not-enabled', 'agent-safe tier not enabled for this repo');
+  if (!/^(claude|codex)\//.test(headRef || '')) return no('branch', 'not an agent branch');
+  if (!issue) return no('issue', 'no linked issue');
+  if (issue.state !== 'open') return no('issue', 'linked issue is not open');
+  if (!issue.labels.includes('ready') && !issue.labels.includes('in-progress')) return no('issue', 'linked issue was not queued (ready)');
+  if (issue.labels.includes('pivotal')) return no('issue', 'linked issue is pivotal');
+  const reasons = [];
+  const add = (code, why) => reasons.push({ code, why });
   for (const f of files) {
     // A rename touches two paths: both must be allowed.
     for (const name of pathsOf(f)) {
-      if (isDependencyFile(name) || isPackageConfig(name)) return { ok: false, why: `dependency or package-manager file ${name}` };
-      if (matchesAny(name, policy.sensitive)) return { ok: false, why: `sensitive path ${name}` };
-      if (matchesAny(name, policy.pivotal)) return { ok: false, why: `pivotal path ${name}` };
+      if (isDependencyFile(name) || isPackageConfig(name)) add('dependency', `dependency or package-manager file ${name}`);
+      if (matchesAny(name, policy.sensitive)) add('sensitive', `sensitive path ${name}`);
+      if (matchesAny(name, policy.pivotal)) add('pivotal', `pivotal path ${name}`);
     }
     // A test moved out of test discovery is a removed test: out of the test
     // paths, or from a name a runner finds to one it doesn't.
     const prev = f.previous_filename;
-    if (prev && ((isTest(prev) && !isTest(f.filename)) || (isTestFile(prev) && !isTestFile(f.filename)))) return { ok: false, why: `test file moved out of tests: ${prev}` };
-    if (f.status === 'removed') return { ok: false, why: pathsOf(f).some(isTest) ? `test file deleted: ${f.filename}` : `file deleted: ${f.filename}` };
+    if (prev && ((isTest(prev) && !isTest(f.filename)) || (isTestFile(prev) && !isTestFile(f.filename)))) add('tests', `test file moved out of tests: ${prev}`);
+    else if (f.status === 'removed') { if (pathsOf(f).some(isTest)) add('tests', `test file deleted: ${f.filename}`); else add('deleted', `file deleted: ${f.filename}`); }
     // Language-agnostic: whatever the file type, an added skip is never
     // agent-safe. Markdown outside test paths is exempt, by the `.md` ending only
     // (not isDoc), and for a rename only when both names are such Markdown files.
     // This assumes the repo runs no tests from Markdown (doctests); a repo that
     // does should not rely on the agent-safe tier for Markdown changes.
-    if (!pathsOf(f).every(isPlainMarkdown) && ADDED_SKIP_LINE.test(f.patch || '')) return { ok: false, why: `test skipped or narrowed in ${f.filename}` };
+    else if (!pathsOf(f).every(isPlainMarkdown) && ADDED_SKIP_LINE.test(f.patch || '')) add('tests', `test skipped or narrowed in ${f.filename}`);
   }
   // An edited test is not a deleted one: the PR fails only when the number of
   // test or assertion lines falls across all its files (countPrTestLines). Inline
@@ -209,11 +221,22 @@ function agentSafe({ headRef, files, policy, issue }) {
   const counts = countPrTestLines(files);
   for (const kind of ['tests', 'assertions']) {
     const { removed, added } = counts[kind];
-    if (removed > added) return { ok: false, why: `${kind} fell from the diff: ${removed} removed, ${added} added` };
+    if (removed > added) add('tests', `${kind} fell from the diff: ${removed} removed, ${added} added`);
   }
   const lines = files.reduce((n, f) => n + (f.additions || 0) + (f.deletions || 0), 0);
-  if (lines > policy.maxLines) return { ok: false, why: `${lines} lines changed (cap ${policy.maxLines})` };
-  return { ok: true, why: `agent-safe: queued issue #${issue.number ?? '?'}, ${lines} lines, no sensitive paths` };
+  if (lines > policy.maxLines) add('size', `${lines} lines changed (cap ${policy.maxLines})`);
+  if (reasons.length) return { ok: false, why: reasons[0].why, reasons };
+  return { ok: true, why: `agent-safe: queued issue #${issue.number ?? '?'}, ${lines} lines, no sensitive paths`, reasons: [] };
+}
+
+// Checked tier (issue #21). An ALLOWLIST of the agentSafe reason codes that may
+// put a PR in risk:checked: over agent_max_lines, a sensitive_paths file, a
+// deleted file, a removed or skipped test. Any other code, including one added
+// to agentSafe later, keeps the PR at risk:normal.
+const CHECKABLE_REASONS = new Set(['size', 'sensitive', 'deleted', 'tests']);
+function checkedTier(safe, policy) {
+  return policy?.agentSafe === true && policy.checkedTier === true && !safe.ok
+    && Array.isArray(safe.reasons) && safe.reasons.length > 0 && safe.reasons.every((r) => CHECKABLE_REASONS.has(r.code));
 }
 
 function isPatchBump(title) {
@@ -370,7 +393,10 @@ function classify({ author, title, labels, files, commitAuthors = [], headRef, p
   const blockers = results.filter((r) => !r.low).map((r) => r.why);
   if (!blockers.length) return { risk: 'low', reasons: [...new Set(results.map((r) => r.why))], agentWhy: null };
   const safe = agentSafe({ headRef, files, policy, issue });
-  return safe.ok ? { risk: 'agent', reasons: [safe.why], agentWhy: null } : { risk: 'normal', reasons: [...blockers, safe.why], agentWhy: safe.why };
+  if (safe.ok) return { risk: 'agent', reasons: [safe.why], agentWhy: null };
+  // risk:checked: reasons are the rules that put it there, all from the allowlist.
+  if (checkedTier(safe, policy)) return { risk: 'checked', reasons: [...new Set(safe.reasons.map((r) => r.why))], agentWhy: safe.why };
+  return { risk: 'normal', reasons: [...blockers, safe.why], agentWhy: safe.why };
 }
 
 // Structured verdicts bound to a commit:
@@ -415,13 +441,19 @@ function verdictFor(item, headSha) {
 // commit; and have a comment by the owner's account created after the thread's
 // last Codex comment. Anything unreadable (unknown parent, missing time or
 // commit) fails closed, so the gate stays red.
+//
+// coveredUntil (issue #21, ms): set only by decide() when a `none-stand` ruling
+// for the head covers the findings (rulingCovers). A Codex comment or badge
+// review raised on the head commit is then tolerated if it was created before
+// that time; every other rule above still applies.
 const ANY_PRIORITY = /(badge\/P\d-|\bP\d\s*Badge)/i;
 const COMPLETED = /^(completed|succeeded|success)$/i;
 const timeOf = (t) => Date.parse(t || '');
-function codexFindingsAnswered({ feedback, headSha, owner }) {
+function codexFindingsAnswered({ feedback, headSha, owner, coveredUntil }) {
   if (!owner) return false;
+  const covered = (x) => Number.isFinite(coveredUntil) && timeOf(x.createdAt) < coveredUntil;
   // A Codex review submitted on the head that carries a finding badge in its body.
-  if (feedback.some((x) => x.author === CODEX_BOT && !Number.isInteger(x.id) && x.commitId === headSha && ANY_PRIORITY.test(x.body || ''))) return false;
+  if (feedback.some((x) => x.author === CODEX_BOT && !Number.isInteger(x.id) && x.commitId === headSha && ANY_PRIORITY.test(x.body || '') && !covered(x))) return false;
   const lines = feedback.filter((x) => Number.isInteger(x.id));
   const byId = new Map(lines.map((x) => [x.id, x]));
   const rootOf = (x) => {
@@ -447,7 +479,7 @@ function codexFindingsAnswered({ feedback, headSha, owner }) {
     const fromCodex = comments.filter((x) => x.author === CODEX_BOT);
     if (!fromCodex.length) continue;
     if (root.author !== CODEX_BOT) return false;
-    if (fromCodex.some((x) => !x.originalCommitId || x.originalCommitId === headSha)) return false;
+    if (fromCodex.some((x) => !x.originalCommitId || (x.originalCommitId === headSha && !covered(x)))) return false;
     const lastCodex = Math.max(...fromCodex.map((x) => timeOf(x.createdAt)));
     if (!Number.isFinite(lastCodex)) return false;
     if (!comments.some((x) => x !== root && x.author === owner && timeOf(x.createdAt) > lastCodex)) return false;
@@ -477,7 +509,7 @@ function onlyCodexStateBlocks(primary, headSha) {
 // head commit blocks even if a summary says otherwise. Line comments also
 // carry id, inReplyToId, originalCommitId and createdAt (see above).
 // Returns 'blocking' | 'answered' | 'missing' | 'clear'.
-function reviewState({ labels, feedback, headSha, headRef, owner }) {
+function reviewState({ labels, feedback, headSha, headRef, owner, coveredUntil }) {
   if (labels.includes('review:blocking')) return 'blocking';
   // On a Codex-written PR the primary review must be Codex's own; a Claude
   // verdict is the separate second review (secondReview), never both.
@@ -491,7 +523,7 @@ function reviewState({ labels, feedback, headSha, headRef, owner }) {
   const verdicts = primary.map((x) => verdictFor(x, headSha)).filter(Boolean);
   const otherFindings = !codexPr && findings.length > 0;
   if (otherFindings || verdicts.includes('blocking')) {
-    const answered = !otherFindings && onlyCodexStateBlocks(primary, headSha) && codexFindingsAnswered({ feedback, headSha, owner });
+    const answered = !otherFindings && onlyCodexStateBlocks(primary, headSha) && codexFindingsAnswered({ feedback, headSha, owner, coveredUntil });
     return answered ? 'answered' : 'blocking';
   }
   if (verdicts.includes('pending')) return 'missing';
@@ -516,6 +548,90 @@ function secondReview({ headRef, feedback, headSha, owner }) {
   const findings = feedback.some((x) => x.author === 'claude[bot]' && x.commitId === headSha && BLOCKING_FINDING.test(x.body || ''));
   if (findings || results.includes('blocking')) return 'blocking';
   return results.includes('clear') ? 'clear' : 'missing';
+}
+
+// Check and ruling verdicts (issue #21; the owner's decision, option 1):
+//  - <!-- check-verdict:v1 {"commit_sha":"…","result":"pass"|"fail"|"unclear"} -->
+//  - <!-- ruling-verdict:v1 {"commit_sha":"…","result":"none-stand"|"stands"|"unclear"} -->
+// For these two markers only, a verdict from the owner's account counts, as
+// well as one from github-actions[bot]. The owner's account is also the agents'
+// identity, so an agent could write its own pass: that proof is kept outside
+// the gate, by an audit of each such merge (residual risk, see the README).
+// review-verdict is unchanged: owner-account verdicts never count there except
+// for the existing Codex second review (secondReview).
+//
+// A marker counts only in a PR conversation comment (kind 'comment') by one of
+// those two accounts, bound to the head commit, outside block quotes and code,
+// and only when that comment carries exactly one marker of its kind. JSON that
+// does not parse, is not an object, or has no string commit_sha counts as none.
+// A result outside the listed values counts as `unclear`.
+const VERDICT_MARKERS = {
+  check: { name: 'check-verdict:v1', re: /<!--\s*check-verdict:v1\s*(\{[\s\S]*?\})\s*-->/, results: ['pass', 'fail', 'unclear'] },
+  ruling: { name: 'ruling-verdict:v1', re: /<!--\s*ruling-verdict:v1\s*(\{[\s\S]*?\})\s*-->/, results: ['none-stand', 'stands', 'unclear'] },
+};
+// The text of a comment without its block quotes, fenced or indented code, or
+// any line with a backtick (inline code), so a quoted or pasted marker is never
+// read as a verdict. An unclosed fence hides the rest of the comment.
+function unquotedText(body) {
+  const out = [];
+  let fence = null;
+  for (const line of String(body || '').split(/\r\n?|\n/)) {
+    const open = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (fence) {
+      if (open && open[1][0] === fence[0] && open[1].length >= fence.length && /^ {0,3}(`+|~+)\s*$/.test(line)) fence = null;
+      continue;
+    }
+    if (open) { fence = open[1]; continue; }
+    if (/^\s*>/.test(line) || /^( {4}|\t)/.test(line) || line.includes('`')) continue;
+    out.push(line);
+  }
+  return out.join('\n');
+}
+// Every counted marker of `kind` for the head: [{ result, at }] (at in ms, NaN if unknown).
+function verdictMarkers({ feedback, headSha, owner }, kind) {
+  const spec = VERDICT_MARKERS[kind];
+  if (typeof headSha !== 'string' || !headSha) return [];
+  const found = [];
+  for (const x of feedback || []) {
+    if (x?.kind !== 'comment') continue;
+    if (x.author !== ACTIONS_BOT && !(owner && x.author === owner)) continue;
+    const text = unquotedText(x.body);
+    if (occurrences(text, spec.name) !== 1) continue;
+    const v = parse(spec.re, text);
+    if (!isPlainObject(v) || typeof v.commit_sha !== 'string' || v.commit_sha !== headSha) continue;
+    found.push({ result: spec.results.includes(v.result) ? v.result : 'unclear', at: timeOf(x.updatedAt || x.createdAt) });
+  }
+  return found;
+}
+// The newest counted verdict, or null. Verdicts that all agree need no times;
+// otherwise a verdict with no readable time, or two different results at the
+// newest time, make the answer `unclear`.
+function newestVerdict(found) {
+  if (!found.length) return null;
+  const at = Math.max(...found.map((v) => v.at));
+  if (new Set(found.map((v) => v.result)).size === 1) return { result: found[0].result, at };
+  if (!Number.isFinite(at)) return { result: 'unclear', at: NaN };
+  const top = new Set(found.filter((v) => v.at === at).map((v) => v.result));
+  return { result: top.size === 1 ? [...top][0] : 'unclear', at };
+}
+// 'pass' | 'fail' | 'unclear' | null (no check of this commit yet).
+const checkVerdict = (input) => newestVerdict(verdictMarkers(input, 'check'))?.result ?? null;
+// { result: 'none-stand' | 'stands' | 'unclear', at } or null. `stands` for the
+// head is a failure until a new commit: a later ruling for the same commit
+// does not replace it.
+function rulingVerdict(input) {
+  const found = verdictMarkers(input, 'ruling');
+  if (found.some((v) => v.result === 'stands')) return { result: 'stands', at: NaN };
+  return newestVerdict(found);
+}
+// A ruling covers the Codex findings only when it was written after every Codex
+// line comment on the PR (any thread, any commit) and every Codex review of the
+// head commit that carries a finding badge. A comment with no readable time is
+// never covered. Other reviewers' findings are never covered by a ruling.
+function rulingCovers({ feedback, headSha }, at) {
+  if (!Number.isFinite(at)) return false;
+  return (feedback || []).filter((x) => x.author === CODEX_BOT && (Number.isInteger(x.id) || (x.commitId === headSha && ANY_PRIORITY.test(x.body || ''))))
+    .every((x) => timeOf(x.createdAt) < at);
 }
 
 // Approval: the latest `labeled` event for human-approved must be by the
@@ -557,32 +673,59 @@ function withReason(fixed, why) {
 
 function decide(input) {
   const { risk, reasons, agentWhy = null } = classify(input);
-  const raw = reviewState(input);
+  // Ruling on answered findings (issue #21). A `none-stand` ruling for the head
+  // that covers every Codex finding (rulingCovers) also lets findings raised on
+  // the head count as answered; it settles them only for risk:normal and
+  // risk:checked, the tiers where answered findings wait for human-approved.
+  const ruling = rulingVerdict(input);
+  const covers = ruling?.result === 'none-stand' && rulingCovers(input, ruling.at);
+  const raw = reviewState(covers ? { ...input, coveredUntil: ruling.at } : input);
   // `answered` is still a block as far as review:override is concerned.
   const overridden = (raw === 'blocking' || raw === 'answered') && reviewOverridden(input);
   const review = overridden ? 'clear' : raw;
   const answered = review === 'answered';
+  const waitsForOwner = risk === 'normal' || risk === 'checked';
+  const settled = answered && covers && waitsForOwner;
   const approved = humanApproved(input);
   const second = secondReview(input);
+  const check = risk === 'checked' ? checkVerdict(input) : null;
+  // The rules that put the PR in risk:checked, for the status description.
+  const checkedWhy = risk === 'checked' ? reasons.join('; ') : null;
   // review:override (owner, same rules as approval) also overrules a blocking Claude review.
   const overridden2 = second === 'blocking' && reviewOverridden(input);
   let state; let description;
   if (input.draft) { state = 'pending'; description = 'Draft PR'; }
   // Answered findings never let a PR merge without the owner: for risk:low and
   // risk:agent they block exactly as unresolved findings do.
-  else if (review === 'blocking' || (answered && risk !== 'normal')) { state = 'failure'; description = 'Reviewer has unresolved findings on this commit (or review:blocking)'; }
+  else if (review === 'blocking' || (answered && !waitsForOwner)) { state = 'failure'; description = 'Reviewer has unresolved findings on this commit (or review:blocking)'; }
+  // A `stands` ruling for this commit fails it, in every tier, until a new commit.
+  else if (ruling?.result === 'stands') { state = 'failure'; description = 'Ruling for this commit: a reviewer finding stands'; }
   else if (review === 'missing') { state = 'pending'; description = 'Waiting for a completed review of this commit'; }
   else if (second === 'blocking' && !overridden2) { state = 'failure'; description = 'Claude review of this Codex PR found P0/P1 issues'; }
   // The owner's own approval of this commit stands in for a missing Claude review.
   else if (second === 'missing' && !approved) { state = 'pending'; description = 'Codex PR: waiting for the Claude review of this commit'; }
   else if (risk === 'low') { state = 'success'; description = overridden ? 'risk:low; review findings overridden by owner' : 'risk:low and reviewed'; }
   else if (risk === 'agent') { state = 'success'; description = overridden ? 'risk:agent; review findings overridden by owner' : 'risk:agent (agent-safe) and reviewed'; }
-  // Only risk:normal reaches here with `answered`.
-  else if (approved) { state = 'success'; description = overridden ? 'human-approved; review findings overridden by owner' : answered ? 'human-approved; reviewer findings answered, not resolved' : 'human-approved and reviewed'; }
+  else if (risk === 'checked') {
+    // human-approved on the head always passes, as for risk:normal. Otherwise the
+    // review must be clean (clear, overridden by the owner, or answered findings
+    // settled by a ruling) and the check of this commit must have passed.
+    const C = 'risk:checked: ';
+    if (approved) { state = 'success'; description = C + (overridden ? 'human-approved; review findings overridden by owner' : 'human-approved and reviewed'); }
+    else if (answered && !settled) { state = 'pending'; description = C + 'waiting for human-approved — reviewer findings answered, not resolved'; }
+    else if (check === 'pass') { state = 'success'; description = C + (overridden ? 'check passed; review findings overridden by owner' : settled ? 'check passed; no reviewer finding stands' : 'check passed and reviewed'); }
+    else if (check === 'fail') { state = 'pending'; description = C + 'check found gaps'; }
+    else if (check === 'unclear') { state = 'pending'; description = C + 'check unclear; waiting for human-approved'; }
+    else { state = 'pending'; description = C + 'waiting for the check of this commit'; }
+    description = withReason(description, checkedWhy);
+  }
+  // Only risk:normal reaches here with `answered`; a settled ruling means the
+  // PR waits for human-approved on its tier alone.
+  else if (approved) { state = 'success'; description = overridden ? 'human-approved; review findings overridden by owner' : answered && !settled ? 'human-approved; reviewer findings answered, not resolved' : 'human-approved and reviewed'; }
   else if (input.labels.includes('human-approved')) { state = 'pending'; description = withReason('risk:normal: approval predates this commit; remove and re-add human-approved', agentWhy); }
-  else if (answered) { state = 'pending'; description = withReason('risk:normal: waiting for human-approved — reviewer findings answered, not resolved', agentWhy); }
+  else if (answered && !settled) { state = 'pending'; description = withReason('risk:normal: waiting for human-approved — reviewer findings answered, not resolved', agentWhy); }
   else { state = 'pending'; description = withReason('risk:normal: waiting for human-approved', agentWhy); }
-  return { risk, reasons, agentWhy, review, secondReview: second, overridden, approved, state, description };
+  return { risk, reasons, agentWhy, review, secondReview: second, overridden, approved, check, ruling: ruling?.result ?? null, settled, state, description };
 }
 
-module.exports = { approvedListError, approvedCopyPlan, approvedCopy, decodeContent, copyHash, ACTIONS_BOT,codexFindingsAnswered, secondReview, pathsOf, countTestLines, countPrTestLines, REMOVED_TEST_LINE, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
+module.exports = { checkVerdict, rulingVerdict, rulingCovers, unquotedText, CHECKABLE_REASONS, approvedListError, approvedCopyPlan, approvedCopy, decodeContent, copyHash, ACTIONS_BOT, codexFindingsAnswered, secondReview, pathsOf, countTestLines, countPrTestLines, REMOVED_TEST_LINE, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };

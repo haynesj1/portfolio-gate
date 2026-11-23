@@ -25,7 +25,7 @@ const run = (sha, at, pr = 1, path = '.github/workflows/pr-gate.yml') => ({ head
 const code = [{ filename: 'src/app.ts', status: 'modified', patch: '+x', additions: 1 }];
 
 function harness({ headSha = 'H', event = 'pull_request_target', action = 'synchronize', files = code, comments = [], timeline = [], runs = [], labels = [], headRef = 'feature', ops = null, issue = null, openPrs = [], issueEvent = null, pushRef = undefined, reviewComments = [], baseSha = 'BASE', contents = {} }) {
-  const written = []; const added = []; const seenRefs = []; const contentReads = [];
+  const written = []; const added = []; const removed = []; const summary = []; const seenRefs = []; const contentReads = [];
   const github = {
     paginate: async (fn, args) => fn(args),
     rest: {
@@ -42,7 +42,7 @@ function harness({ headSha = 'H', event = 'pull_request_target', action = 'synch
         get: async ({ issue_number: n }) => { if (!issue || issue.number !== n) throw Object.assign(new Error('nf'), { status: 404 }); return { data: issue }; },
         listComments: async () => comments,
         addLabels: async ({ labels: l }) => added.push(...l),
-        removeLabel: async () => {},
+        removeLabel: async ({ name }) => removed.push(name),
       },
       repos: {
         createCommitStatus: async (s) => written.push(s),
@@ -65,8 +65,8 @@ function harness({ headSha = 'H', event = 'pull_request_target', action = 'synch
     ref: pushRef, repo: { owner: OWNER, repo: 'r' }, eventName: event, serverUrl: 'https://github.com', runId: 42,
     payload: issueEvent || { action, label: action === 'labeled' ? { name: 'human-approved' } : undefined, pull_request: { number: 1, updated_at: '2026-11-06T10:00:00Z' } },
   };
-  const core = { info() {}, warning() {}, summary: { addHeading() { return this; }, addList() { return this; }, write: async () => {} } };
-  return { github, run: () => script(github, context, core, require), written, added, seenRefs, contentReads, gate: () => written.filter((s) => s.context === 'review-gate').at(-1) };
+  const core = { info() {}, warning() {}, summary: { addHeading() { return this; }, addList(l) { summary.push(...l); return this; }, write: async () => {} } };
+  return { github, run: () => script(github, context, core, require), written, added, removed, summary, seenRefs, contentReads, gate: () => written.filter((s) => s.context === 'review-gate').at(-1) };
 }
 
 test('workflow: owner approval after the head was first seen passes', async () => {
@@ -193,6 +193,11 @@ test('caller comment filter: review results evaluate, other comments are skipped
   // Claude reviewer verdicts evaluate.
   assert.equal(onComment('<!-- review-verdict:v1 {"commit_sha":"abc","result":"clear"} -->'), true);
   assert.equal(onComment('<!-- review-verdict:v1 {"commit_sha":"abc","result":"blocking"} -->'), true);
+  // Check and ruling verdicts (risk:checked tier, #21) evaluate, as does an edit that removes one.
+  assert.equal(onComment('Check done.\n<!-- check-verdict:v1 {"commit_sha":"abc","result":"pass"} -->'), true);
+  assert.equal(onComment('<!-- ruling-verdict:v1 {"commit_sha":"abc","result":"none-stand"} -->'), true);
+  assert.equal(onComment('Withdrawn.', true, '<!-- check-verdict:v1 {"commit_sha":"abc","result":"pass"} -->'), true);
+  assert.equal(onComment('Withdrawn.', true, '<!-- ruling-verdict:v1 {"commit_sha":"abc","result":"stands"} -->'), true);
   // Ordinary comments, PR summaries and comments on plain issues are skipped.
   assert.equal(onComment('Fixed in the latest push.'), false);
   assert.equal(onComment('<!-- pr-summary:v1 -->\n## Summary for the owner'), false);
@@ -224,7 +229,7 @@ test('caller PR filter: unread label changes and title-only edits are skipped', 
   const run = (github) => Boolean(new Function('github', 'contains', `return (${js});`)(github, contains));
   const pr = (action, extra = {}, author = 'octocat') => run({ event_name: 'pull_request_target', event: { action, pull_request: { user: { login: author } }, ...extra } });
   const label = (action, name) => pr(action, name === undefined ? {} : { label: { name } });
-  for (const l of ['human-approved', 'review:override', 'review:blocking', 'type:dead-code', 'risk:low', 'risk:agent', 'risk:normal']) {
+  for (const l of ['human-approved', 'review:override', 'review:blocking', 'type:dead-code', 'risk:low', 'risk:agent', 'risk:checked', 'risk:normal']) {
     assert.equal(label('labeled', l), true, `labeled ${l}`);
     assert.equal(label('unlabeled', l), true, `unlabeled ${l}`);
   }
@@ -466,4 +471,83 @@ test('workflow: no content is read unless every changed file is a listed path (#
     assert.deepEqual(r.contentReads, [], status);
     assert.deepEqual(r.added, ['risk:normal'], status);
   }
+});
+
+// ---- risk:checked tier and rulings (#21) -----------------------------------
+const SENS_OPS = 'agent_safe: true\nsensitive_paths:\n  - "src/auth/**"\n';
+const sensFiles = [{ filename: 'src/auth/login.ts', status: 'modified', patch: '+x', additions: 1 }];
+const verdict = (kind, sha, result, login = 'github-actions[bot]', at = '2026-11-06T11:00:00Z') => ({ user: { login }, created_at: at, updated_at: at,
+  body: `Result below.\n<!-- ${kind}-verdict:v1 {"commit_sha":"${sha}","result":"${result}"} -->` });
+const checkedPr = (extra = {}) => harness({ headRef: 'claude/7', ops: SENS_OPS, issue: { number: 7, state: 'open', labels: [{ name: 'ready' }] }, files: sensFiles,
+  runs: [run('H', '2026-11-06T09:00:00Z')], labels: ['risk:normal'], ...extra });
+
+test('workflow: a checked PR with a clean review and a passing check succeeds, labelled risk:checked (#21)', async () => {
+  const h = checkedPr({ comments: [codexComment('H'), verdict('check', 'H', 'pass')] });
+  await h.run();
+  assert.equal(h.gate().state, 'success');
+  assert.equal(h.gate().description, 'risk:checked: check passed and reviewed — sensitive path src/auth/login.ts');
+  assert.deepEqual(h.added, ['risk:checked']);
+  assert.deepEqual(h.removed, ['risk:normal']);
+  assert.ok(h.seenRefs.length >= 1 && h.seenRefs.every((r) => r === 'main'));
+  assert.ok(h.summary.includes('in risk:checked because: sensitive path src/auth/login.ts'), h.summary.join('\n'));
+  assert.ok(h.summary.includes('check of this commit: pass'));
+  // the owner's account counts too; nothing yet means waiting for the check
+  const owner = checkedPr({ comments: [codexComment('H'), verdict('check', 'H', 'pass', OWNER)] });
+  await owner.run();
+  assert.equal(owner.gate().state, 'success');
+  const none = checkedPr({ comments: [codexComment('H')] });
+  await none.run();
+  assert.equal(none.gate().description, 'risk:checked: waiting for the check of this commit — sensitive path src/auth/login.ts');
+});
+
+test('workflow: a checked PR whose check is unclear waits for human-approved (#21)', async () => {
+  const h = checkedPr({ comments: [codexComment('H'), verdict('check', 'H', 'unclear', OWNER)] });
+  await h.run();
+  assert.equal(h.gate().state, 'pending');
+  assert.equal(h.gate().description, 'risk:checked: check unclear; waiting for human-approved — sensitive path src/auth/login.ts');
+  assert.deepEqual(h.added, ['risk:checked']);
+  assert.ok(h.summary.includes('check of this commit: unclear'));
+  // human-approved on the head passes it
+  const ok = checkedPr({ labels: ['human-approved'], timeline: [labelled('2026-11-06T10:00:00Z')], comments: [codexComment('H'), verdict('check', 'H', 'unclear', OWNER)] });
+  await ok.run();
+  assert.equal(ok.gate().state, 'success');
+  // a verdict from another account, or for another commit, is no check
+  for (const c of [verdict('check', 'H', 'pass', 'someone'), verdict('check', 'OLD', 'pass')]) {
+    const x = checkedPr({ comments: [codexComment('H'), c] });
+    await x.run();
+    assert.equal(x.gate().description, 'risk:checked: waiting for the check of this commit — sensitive path src/auth/login.ts');
+  }
+});
+
+test('workflow: checked_tier: false on the default branch keeps such PRs risk:normal (#21)', async () => {
+  const h = checkedPr({ ops: `${SENS_OPS}checked_tier: false\n`, labels: [], comments: [codexComment('H'), verdict('check', 'H', 'pass')] });
+  await h.run();
+  assert.equal(h.gate().state, 'pending');
+  assert.equal(h.gate().description, 'risk:normal: waiting for human-approved — sensitive path src/auth/login.ts');
+  assert.deepEqual(h.added, ['risk:normal']);
+  assert.ok(h.seenRefs.every((r) => r === 'main'));
+  // a PR that edits .ops.yml to turn it back on is still risk:normal (protected path; the default-branch copy is read)
+  const self = checkedPr({ ops: `${SENS_OPS}checked_tier: false\n`, labels: [], comments: [codexComment('H'), verdict('check', 'H', 'pass')],
+    files: [...sensFiles, { filename: '.ops.yml', status: 'modified', patch: '-checked_tier: false\n+checked_tier: true', additions: 1, deletions: 1 }] });
+  await self.run();
+  assert.equal(self.gate().description, 'risk:normal: waiting for human-approved — protected path .ops.yml');
+});
+
+test('workflow: a none-stand ruling lets an answered checked PR proceed to its check (#21)', async () => {
+  const codexBot = { login: 'chatgpt-codex-connector[bot]' };
+  const reviewComments = [
+    { id: 1, user: codexBot, body: '![P1 Badge](https://img.shields.io/badge/P1-orange) problem', commit_id: 'H', original_commit_id: 'C1', created_at: '2026-11-06T09:00:00Z' },
+    { id: 101, in_reply_to_id: 1, user: { login: OWNER }, body: 'Fixed in C3.', commit_id: 'H', original_commit_id: 'C3', created_at: '2026-11-06T09:30:00Z' },
+  ];
+  const waiting = checkedPr({ comments: [codexComment('H', true), verdict('check', 'H', 'pass')], reviewComments });
+  await waiting.run();
+  assert.equal(waiting.gate().description, 'risk:checked: waiting for human-approved — reviewer findings answered, not resolved — sensitive path src/auth/login.ts');
+  const ruled = checkedPr({ comments: [codexComment('H', true), verdict('ruling', 'H', 'none-stand', OWNER), verdict('check', 'H', 'pass')], reviewComments });
+  await ruled.run();
+  assert.equal(ruled.gate().state, 'success');
+  assert.equal(ruled.gate().description, 'risk:checked: check passed; no reviewer finding stands — sensitive path src/auth/login.ts');
+  const stands = checkedPr({ comments: [codexComment('H', true), verdict('ruling', 'H', 'stands'), verdict('check', 'H', 'pass')], reviewComments });
+  await stands.run();
+  assert.equal(stands.gate().state, 'failure');
+  assert.equal(stands.gate().description, 'Ruling for this commit: a reviewer finding stands');
 });

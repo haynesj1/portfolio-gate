@@ -2,11 +2,15 @@
 
 A merge gate for repositories where AI coding agents open pull requests. It sets one required commit status, `review-gate`, that passes only when:
 
-1. **a reviewer bot has reviewed the current head commit** with no unresolved findings from Codex, and no unresolved P0/P1 finding from any other reviewer (Codex's review summary, or a structured verdict from a Claude reviewer); for `risk:normal` PRs, Codex findings that are all answered also count once the owner approves (see below), and
-2. one of:
-   - **the change is low risk** (`risk:low`: docs, added tests, Dependabot patch bumps, deletion-only dead-code removal, approved copies of shared files);
-   - **the change is agent-safe** (`risk:agent`, opt-in per repo, see below);
-   - **the repository owner has approved this exact commit** with the `human-approved` label (`risk:normal`).
+1. **a reviewer bot has reviewed the current head commit** with no unresolved findings from Codex, and no unresolved P0/P1 finding from any other reviewer (Codex's review summary, or a structured verdict from a Claude reviewer); for `risk:normal` and `risk:checked` PRs, Codex findings that are all answered also count once the owner approves or a ruling says none stands (see below), and
+2. the PR's tier allows it:
+
+| Tier (label) | What puts a PR there | What passes it, once reviewed |
+|---|---|---|
+| `risk:low` | docs, added tests, Dependabot patch bumps, deletion-only dead-code removal, approved copies of shared files | nothing more |
+| `risk:agent` | an agent PR that meets every agent-safe rule (opt-in per repo, see below) | nothing more |
+| `risk:checked` | an agent PR kept out of `risk:agent` **only** by its size, a `sensitive_paths` file, a deleted file, or a removed or skipped test (see below) | a `check-verdict` of `pass` for the head commit, or `human-approved` on it |
+| `risk:normal` | everything else | the owner's `human-approved` label on this exact commit |
 
 ## Answered findings wait for `human-approved`
 
@@ -17,6 +21,50 @@ Codex reports `has_unresolved_findings: true` until a person resolves each of it
 - no Codex comment in those threads was first made on the head commit, and no Codex review of the head commit carries a finding badge. A finding Codex raises or repeats on the newest commit always blocks, as does a Codex comment after the owner's last reply.
 
 For a `risk:normal` PR, `answered` reads "risk:normal: waiting for human-approved — reviewer findings answered, not resolved", and the owner's `human-approved` on that commit passes it ("human-approved; reviewer findings answered, not resolved") without resolving each thread. Agents comment with the owner's identity, so a reply proves nothing on its own: `answered` **never applies to `risk:low` or `risk:agent`**, which fail with the unresolved-findings text exactly as before, and it never passes a PR without the owner's approval. `review:override` works as before, and on `codex/` PRs it covers Codex's review only (the Claude second review is unchanged). The gate never resolves or writes to review threads. Thread replies don't trigger the gate themselves; it recomputes on the next review result or label change, such as adding `human-approved`.
+
+## Checked tier (`risk:checked`)
+
+Most of the owner's approvals are on agent PRs that only need someone to confirm they do what their issue asked. A second, independent check can do that, so an agent PR that fails the agent-safe rules **only** for one or more of these reasons is `risk:checked` instead of `risk:normal`:
+
+- it changes more than `agent_max_lines` lines;
+- it touches a `sensitive_paths` file;
+- it deletes a file;
+- it removes or skips a test (the test count falls, a test file is deleted or moved out of test discovery, or a skip is added).
+
+Every other agent-safe rule must still hold: the repo has `agent_safe: true`, the branch is `claude/…` or `codex/…`, the linked issue is open, queued and not `pivotal`, and the PR touches no protected path, no `pivotal_paths` file and no dependency or package-manager file. The reasons are an allowlist in `gate/gate.js` (`CHECKABLE_REASONS`), so any rule added later keeps a PR at `risk:normal` unless it is added there on purpose. Approved copies come first, as before: a PR whose every file is an approved copy is `risk:low`, and one that is not (a near miss, or a copy plus any other file) touches a protected path, so it is `risk:normal`, never `risk:checked`.
+
+The check and the ruling sessions are started outside the gate. They post their verdicts as PR comments, each bound to a commit:
+
+```html
+<!-- check-verdict:v1 {"commit_sha":"<head sha>","result":"pass"|"fail"|"unclear"} -->
+<!-- ruling-verdict:v1 {"commit_sha":"<head sha>","result":"none-stand"|"stands"|"unclear"} -->
+```
+
+A marker counts only when it is in a PR conversation comment (not a review or a line comment) written by the repository owner's account or by `github-actions[bot]`, names the head commit, and is outside block quotes, code blocks and inline code, with no second marker of the same kind in that comment. The newest counted verdict wins (an edited comment is as new as its edit); verdicts that disagree at the same time, or that cannot be ordered, read as `unclear`. A marker whose JSON does not parse, or has no `commit_sha`, counts as none; a result outside the listed values reads as `unclear`. A new commit clears every verdict.
+
+The caller evaluates the gate when a comment carrying either marker is posted, or edited to remove one; until an app repository has the updated caller, a verdict there is read at the next PR event instead.
+
+| `risk:checked`, review clean | Status |
+|---|---|
+| no check verdict for the head | pending: `risk:checked: waiting for the check of this commit — <reason>` |
+| `pass` | **success**: `risk:checked: check passed and reviewed — <reason>` |
+| `fail` | pending: `risk:checked: check found gaps — <reason>` |
+| `unclear` | pending: `risk:checked: check unclear; waiting for human-approved — <reason>` |
+| `human-approved` on the head, any verdict | **success**, as for `risk:normal` |
+
+`<reason>` lists every rule that put the PR in the tier (shortened to fit 140 characters), and the job summary repeats it as `in risk:checked because: …`, with the check and ruling it read. "Review clean" means the same as for `risk:agent`: the review of the head commit is clear, or the owner overruled findings with `review:override`; or, from this tier, answered findings that a ruling settled (below). A Codex PR still needs its Claude second review.
+
+**Off switch:** `checked_tier: false` in `.ops.yml` on the default branch turns the tier off for that repository; such PRs are `risk:normal` exactly as before. Absent means on, but only where `agent_safe: true`. Any other value (`no`, `"false"`, …) is unreadable and, like every unreadable line, switches the agent-safe tier off too. `.ops.yml` is read from the default branch only and is a protected path, so a PR cannot turn the tier on for itself.
+
+### Rulings on answered findings
+
+Where the gate would say "waiting for human-approved — reviewer findings answered, not resolved" (`risk:normal`, and now `risk:checked`), a `none-stand` ruling for the head commit lets the PR proceed by its own tier: a `risk:checked` PR goes on to its check, and a `risk:normal` PR waits for `human-approved` on its tier alone. `unclear`, or no ruling, keeps that behaviour. `stands` fails the PR (`Ruling for this commit: a reviewer finding stands`), in every tier, until a new commit: a later ruling for the same commit does not replace it, and neither `human-approved` nor `review:override` overrules it. Answered findings on `risk:low` and `risk:agent` PRs fail as before, with or without a ruling.
+
+A ruling **covers** the findings only if it was written after every Codex line comment on the PR (any thread, any commit) and after every Codex review of the head commit that carries a finding badge; a comment or ruling without a readable time is never covered. A Codex finding raised on the head commit still blocks unless a covering ruling exists, and even then its thread needs the owner's reply after Codex's last comment, like every answered thread. Other reviewers' P0/P1 findings, a blocking verdict and `review:blocking` are never covered.
+
+### Residual risk (the owner's decision)
+
+The gate ignores verdicts that the owner's account writes on its own review (`review-verdict`), because agents act with that account and could write their own pass; that is unchanged. For the two markers above, and only for them, a verdict from the owner's account **is** accepted. So an agent could write a `pass` or `none-stand` for its own PR and merge a `risk:checked` PR without a real check. The gate cannot tell; the proof that each check was started independently is kept outside the gate, by an audit of each such merge. This is residual risk of the same kind the agent-safe tier already accepts (agents can also set issue labels such as `ready`). The size, path, issue and test rules that remain, the bot review of the head commit, and the audit are the controls. A repository that does not accept this sets `checked_tier: false`.
 
 ## Codex-written PRs need a second review
 
@@ -34,11 +82,14 @@ Off unless the repo's `.ops.yml` **on the default branch** says `agent_safe: tru
 - it changes at most `agent_max_lines` lines (default 400);
 - a reviewer bot has cleared the head commit, as for every tier. CI checks are required separately by the repo's ruleset.
 
+A PR that fails only the size, `sensitive_paths`, deleted-file or test rules is `risk:checked` (see [Checked tier](#checked-tier-riskchecked)) unless `.ops.yml` says `checked_tier: false`.
+
 ```yaml
 # .ops.yml (example)
 agent_safe: true
 agent_max_lines: 400
-sensitive_paths:       # always need human-approved
+checked_tier: true     # default; false makes the PRs below risk:normal again
+sensitive_paths:       # risk:checked: need a passing check, or human-approved
   - "src/auth/**"
   - db/migrations/
 pivotal_paths:         # core-journey UI that the owner wants to see first
@@ -81,13 +132,14 @@ The agents act with the owner's GitHub identity: they can push, comment, label a
 | `review-gate` status | Rulesets require it **from the GitHub Actions app**; a status posted with the owner's token doesn't count |
 | The gate's own code | App repos call it only from `pull_request_target` / `issue_comment`, which run the default-branch copy, so a PR can't change the gate judging it |
 | Review verdicts | Structured, bound to the head SHA, and posted by known bot accounts |
+| Check and ruling verdicts | Structured and bound to the head SHA, but accepted from the owner's account: **not** forgery-proof; each merge they allow is audited outside the gate (see the checked tier) |
 | Approval timing | The label event must be by the owner directly (not `performed_via_github_app`) and later than the gate's first recorded run for this PR and SHA, and than any force push |
 
 Reviewers can be wrong, so the owner can overrule blocking findings for the current commit with `review:override` (same rules as approval).
 
 Known residual risk: agent apps with the Workflows permission could add a workflow that writes an Actions-attributed status. Mitigated by tool permissions, provenance links on every status, and a daily audit of merged PRs.
 
-The caller skips two kinds of pull request event that cannot change the gate's answer, so no runner starts (a skipped job uses no Actions minutes). A label change is skipped unless the label is `human-approved`, `review:override`, `review:blocking`, `type:dead-code`, `risk:low`, `risk:agent` or `risk:normal`; adding and removing are treated alike, and a label event with no label name evaluates. An edit is skipped only when it changed the title and nothing else (no body, no base branch) and the author is not Dependabot, whose title the gate reads. Every other edit and every other PR action evaluates.
+The caller skips two kinds of pull request event that cannot change the gate's answer, so no runner starts (a skipped job uses no Actions minutes). A label change is skipped unless the label is `human-approved`, `review:override`, `review:blocking`, `type:dead-code`, `risk:low`, `risk:agent`, `risk:checked` or `risk:normal`; adding and removing are treated alike, and a label event with no label name evaluates. An edit is skipped only when it changed the title and nothing else (no body, no base branch) and the author is not Dependabot, whose title the gate reads. Every other edit and every other PR action evaluates.
 
 ## Use
 
