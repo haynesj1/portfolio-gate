@@ -142,9 +142,12 @@ pivotal_paths: ["src/routes/reveal/**"]
 const policy = g.parseOpsPolicy(OPS);
 const queued = { number: 7, state: 'open', labels: ['ready', 'agent:claude'] };
 const agentPr = { ...base, headRef: 'claude/7', policy, issue: queued, files: [f('src/app.ts', '+x', { additions: 20, deletions: 5 })] };
+// The same policy with the checked tier switched off (issue #21): today's behaviour.
+const policyOff = g.parseOpsPolicy(`${OPS}checked_tier: false\n`);
+const offRisk = (over) => g.classify({ ...agentPr, policy: policyOff, ...over }).risk;
 
 test('agent-safe: .ops.yml policy is parsed, off by default', () => {
-  assert.deepEqual(policy, { agentSafe: true, maxLines: 300, sensitive: ['src/auth/**', 'db/migrations/'], pivotal: ['src/routes/reveal/**'] });
+  assert.deepEqual(policy, { agentSafe: true, maxLines: 300, sensitive: ['src/auth/**', 'db/migrations/'], pivotal: ['src/routes/reveal/**'], checkedTier: true });
   assert.equal(g.parseOpsPolicy('app: x\n').agentSafe, false);
   assert.equal(g.parseOpsPolicy('').maxLines, 400);
 });
@@ -172,8 +175,8 @@ test('agent-safe: a small agent PR for a queued issue is risk:agent and passes o
   assert.equal(g.decide({ ...agentPr, feedback: [codex('H', true)] }).state, 'failure');
 });
 
-test('agent-safe: each condition falls back to risk:normal', () => {
-  const normal = (over) => g.classify({ ...agentPr, ...over }).risk;
+test('agent-safe: each condition falls back to risk:normal (or risk:checked for its four reasons, #21)', () => {
+  const normal = (over) => { const r = g.classify({ ...agentPr, ...over }).risk; assert.equal(offRisk(over), 'normal'); return r; };
   assert.equal(normal({ policy: g.parseOpsPolicy('app: x') }), 'normal');
   assert.equal(normal({ policy: null }), 'normal');
   assert.equal(normal({ headRef: 'feature/7' }), 'normal');
@@ -181,12 +184,12 @@ test('agent-safe: each condition falls back to risk:normal', () => {
   assert.equal(normal({ issue: { ...queued, state: 'closed' } }), 'normal');
   assert.equal(normal({ issue: { ...queued, labels: ['agent:claude'] } }), 'normal');
   assert.equal(normal({ issue: { ...queued, labels: ['ready', 'pivotal'] } }), 'normal');
-  assert.equal(normal({ files: [f('src/auth/login.ts')] }), 'normal');
+  assert.equal(normal({ files: [f('src/auth/login.ts')] }), 'checked');
   assert.equal(normal({ files: [f('src/routes/reveal/+page.svelte')] }), 'normal');
   assert.equal(normal({ files: [f('package.json')] }), 'normal');
-  assert.equal(normal({ files: [f('src/old.ts', '', { status: 'removed' })] }), 'normal');
-  assert.equal(normal({ files: [f('src/a.test.ts', "-it('works', () => {})")] }), 'normal');
-  assert.equal(normal({ files: [f('src/a.ts', '+x', { additions: 250, deletions: 51 })] }), 'normal');
+  assert.equal(normal({ files: [f('src/old.ts', '', { status: 'removed' })] }), 'checked');
+  assert.equal(normal({ files: [f('src/a.test.ts', "-it('works', () => {})")] }), 'checked');
+  assert.equal(normal({ files: [f('src/a.ts', '+x', { additions: 250, deletions: 51 })] }), 'checked');
   assert.equal(normal({ files: [f('.github/workflows/ci.yml')] }), 'normal');
   assert.equal(normal({ files: [f('AGENTS.md')] }), 'normal');
 });
@@ -209,7 +212,8 @@ pivotal_paths:
   assert.deepEqual(p.sensitive, ['src/auth/**', 'src/payments/**']);
   assert.deepEqual(p.pivotal, ['src/routes/reveal/**']);
   assert.equal(p.agentSafe, true);
-  assert.equal(g.classify({ ...agentPr, policy: p, files: [f('src/payments/charge.ts')] }).risk, 'normal');
+  assert.equal(g.classify({ ...agentPr, policy: p, files: [f('src/payments/charge.ts')] }).risk, 'checked');
+  assert.equal(g.classify({ ...agentPr, policy: { ...p, checkedTier: false }, files: [f('src/payments/charge.ts')] }).risk, 'normal');
 });
 
 test('agent-safe: unreadable policy syntax turns the tier off (fail closed)', () => {
@@ -221,8 +225,9 @@ test('agent-safe: unreadable policy syntax turns the tier off (fail closed)', ()
 test('renames are judged on both the old and the new path (Codex P1)', () => {
   const ren = (from, to) => f(to, '+x', { status: 'renamed', previous_filename: from });
   const c = (files) => g.classify({ ...agentPr, files }).risk;
-  assert.equal(c([ren('src/auth/login.ts', 'src/login.ts')]), 'normal');
-  assert.equal(c([ren('src/login.ts', 'src/auth/login.ts')]), 'normal');
+  assert.equal(c([ren('src/auth/login.ts', 'src/login.ts')]), 'checked');
+  assert.equal(c([ren('src/login.ts', 'src/auth/login.ts')]), 'checked');
+  assert.equal(offRisk({ files: [ren('src/auth/login.ts', 'src/login.ts')] }), 'normal');
   assert.equal(c([ren('src/routes/reveal/a.svelte', 'src/a.svelte')]), 'normal');
   assert.equal(c([ren('.github/workflows/ci.yml', 'ci.yml')]), 'normal');
   assert.equal(c([ren('src/a.ts', 'src/b.ts')]), 'agent');
@@ -294,8 +299,9 @@ test('the owner approving a Codex PR stands in for a missing Claude review, not 
 test('renaming a test out of test discovery is not agent-safe (Codex P2)', () => {
   const ren = (from, to, patch = '+x') => f(to, patch, { status: 'renamed', previous_filename: from });
   const c = (files) => g.classify({ ...agentPr, files }).risk;
-  assert.equal(c([ren('tests/auth.test.ts', 'src/helper.ts')]), 'normal');
-  assert.equal(c([ren('src/a.test.ts', 'src/b.test.ts', "-it('x', () => {})")]), 'normal');
+  assert.equal(c([ren('tests/auth.test.ts', 'src/helper.ts')]), 'checked');
+  assert.equal(c([ren('src/a.test.ts', 'src/b.test.ts', "-it('x', () => {})")]), 'checked');
+  assert.equal(offRisk({ files: [ren('tests/auth.test.ts', 'src/helper.ts')] }), 'normal');
   assert.equal(c([ren('src/a.test.ts', 'src/b.test.ts')]), 'low'); // a plain test rename is already low risk
 });
 
@@ -303,7 +309,7 @@ test('indentless YAML list items are read; stray lines turn the tier off (Codex 
   const p = g.parseOpsPolicy('agent_safe: true\nsensitive_paths:\n- src/auth/**\n- "db/"\npivotal_paths:\n- src/reveal/**\n');
   assert.deepEqual(p.sensitive, ['src/auth/**', 'db/']);
   assert.deepEqual(p.pivotal, ['src/reveal/**']);
-  assert.equal(g.classify({ ...agentPr, policy: p, files: [f('src/auth/login.ts')] }).risk, 'normal');
+  assert.equal(g.classify({ ...agentPr, policy: p, files: [f('src/auth/login.ts')] }).risk, 'checked');
   assert.equal(g.parseOpsPolicy('agent_safe: true\nsensitive_paths:\n- a/**\nnot a key\n').agentSafe, false);
 });
 
@@ -366,14 +372,15 @@ test('lockfiles and package-manager config are never agent-safe (Codex P2)', () 
 });
 
 test('test removals are caught in any language and any file (Codex P2)', () => {
-  const c = (filename, patch) => g.classify({ ...agentPr, files: [f(filename, patch, { additions: 0, deletions: 5 })] }).risk;
-  assert.equal(c('internal/auth/login_test.go', '-func TestRejectInvalidToken(t *testing.T) {'), 'normal');
-  assert.equal(c('internal/auth/login.go', '-\tif err != nil { t.Fatal(err) }'), 'normal');
-  assert.equal(c('src/lib.rs', '-#[test]'), 'normal');
-  assert.equal(c('spec/user_spec.rb', "-  it 'works' do"), 'normal');
-  assert.equal(c('app/src/main/FooTest.kt', '-    @Test fun works() {}'), 'normal');
-  assert.equal(c('src/thing.go', '+\tt.Skip("later")'), 'normal');
-  assert.equal(c('src/a.py', '+@pytest.mark.xfail'), 'normal');
+  // (issue #21: a removed or skipped test is a risk:checked reason; normal with the tier off)
+  const c = (filename, patch) => { const files = [f(filename, patch, { additions: 0, deletions: 5 })]; const r = g.classify({ ...agentPr, files }).risk; if (r === 'checked') assert.equal(offRisk({ files }), 'normal'); return r; };
+  assert.equal(c('internal/auth/login_test.go', '-func TestRejectInvalidToken(t *testing.T) {'), 'checked');
+  assert.equal(c('internal/auth/login.go', '-\tif err != nil { t.Fatal(err) }'), 'checked');
+  assert.equal(c('src/lib.rs', '-#[test]'), 'checked');
+  assert.equal(c('spec/user_spec.rb', "-  it 'works' do"), 'checked');
+  assert.equal(c('app/src/main/FooTest.kt', '-    @Test fun works() {}'), 'checked');
+  assert.equal(c('src/thing.go', '+\tt.Skip("later")'), 'checked');
+  assert.equal(c('src/a.py', '+@pytest.mark.xfail'), 'checked');
   // ordinary code edits still qualify
   assert.equal(c('src/app.ts', '-const x = 1;\n+const x = 2;'), 'agent');
   // Go test files are recognised as tests (added tests alone are low risk)
@@ -390,7 +397,8 @@ test('the removed-test backstop skips Markdown files outside test paths', () => 
   assert.equal(run(f('docs/guide.md', '+The review is pending')).risk, 'agent');
   assert.equal(run(ren('docs/a.md', 'docs/b.md', '-  "context": {')).risk, 'agent');
   // the backstop still applies to everything else
-  const kept = (file, why) => { const r = run(file); assert.equal(r.risk, 'normal'); assert.equal(r.agentWhy, why); };
+  // (issue #21: a removed test is a risk:checked reason; a protected path never is)
+  const kept = (file, why) => { const r = run(file); assert.equal(r.risk, why.startsWith('protected path') ? 'normal' : 'checked'); assert.equal(r.agentWhy, why); };
   // (issue #6: the reason is now the PR-wide count, not the file name)
   const fell = 'tests fell from the diff: 1 removed, 0 added';
   kept(f('src/a.ts', '-  "context": {'), fell);
@@ -405,7 +413,8 @@ test('the removed-test backstop skips Markdown files outside test paths', () => 
 // ---- counted tests and assertions (issue #6) --------------------------------
 const run6 = (...files) => g.classify({ ...agentPr, files });
 const isAgent = (...files) => { const r = run6(...files); assert.equal(r.risk, 'agent', r.agentWhy); };
-const keptOut = (why, ...files) => { const r = run6(...files); assert.equal(r.risk, 'normal'); assert.equal(r.agentWhy, why); };
+// Every reason here is a removed or skipped test: risk:checked, and risk:normal with the tier off (#21).
+const keptOut = (why, ...files) => { const r = run6(...files); assert.equal(r.risk, 'checked'); assert.equal(r.agentWhy, why); assert.equal(offRisk({ files }), 'normal'); };
 const ren6 = (from, to, patch = '+x') => f(to, patch, { status: 'renamed', previous_filename: from });
 const realTest = "-it('doubles', () => {\n-  expect(double(2)).toBe(4);\n-});";
 
@@ -526,9 +535,13 @@ test('description: each agentSafe rule names itself after the unchanged fixed te
     [{ files: [f('src/a.test.ts', "-it('works', () => {})")] }, 'tests fell from the diff: 1 removed, 0 added'],
     [{ files: [f('src/a.ts', '+x', { additions: 250, deletions: 51 })] }, '301 lines changed (cap 300)'],
   ];
+  // Four of these put the PR in risk:checked (#21), which names the same reason;
+  // with the checked tier off, every one reads exactly as before.
+  const CHECKED = new Set(['sensitive path src/auth/login.ts', 'file deleted: src/old.ts', 'tests fell from the diff: 1 removed, 0 added', '301 lines changed (cap 300)']);
   for (const [over, why] of cases) {
     assert.equal(g.classify({ ...agentPr, ...over }).agentWhy, why);
-    assert.equal(descOf(over), `${WAIT} — ${why}`);
+    assert.equal(descOf(over), CHECKED.has(why) ? `risk:checked: waiting for the check of this commit — ${why}` : `${WAIT} — ${why}`);
+    if (!over.policy) assert.equal(descOf({ policy: policyOff, ...over }), `${WAIT} — ${why}`);
   }
 });
 
@@ -957,4 +970,386 @@ test('approved copies: the shipped list has the caller entry and the shared AGEN
   assert.equal(g.approvedListError(shipped), null);
   assert.deepEqual(shipped.files.map((e) => e.path), [COPY]);
   assert.deepEqual(shipped.blocks.map((e) => e.path), ['AGENTS.md']);
+});
+
+// ---- risk:checked tier and rulings on answered findings (#21) -------------
+const ACTIONS_BOT = 'github-actions[bot]';
+const VAT = '2026-11-06T11:00:00Z';
+const marker = (kind, sha, result, { author = ACTIONS_BOT, at = VAT, body } = {}) => ({
+  kind: 'comment', author, createdAt: at, body: body ?? `<!-- ${kind}-verdict:v1 {"commit_sha":"${sha}","result":"${result}"} -->`,
+});
+const checkV = (sha, result, o) => marker('check', sha, result, o);
+const rulingV = (sha, result, o) => marker('ruling', sha, result, o);
+const SENS = 'sensitive path src/auth/login.ts';
+const sensitivePr = { ...agentPr, files: [f('src/auth/login.ts', '+x', { additions: 10 })] };
+const withFb = (pr, ...extra) => ({ ...pr, feedback: [...pr.feedback, ...extra] });
+const CK = (text, why = SENS) => `risk:checked: ${text} — ${why}`;
+const big = f('src/a.ts', '+x', { additions: 250, deletions: 51 });
+const deleted = f('src/old.ts', '', { status: 'removed', additions: 0 });
+const removedTest = f('src/a.test.ts', "-it('works', () => {})");
+
+test('#21 checked: each of the four reasons alone, and all together, is risk:checked naming its reasons', () => {
+  for (const [file, why] of [[f('src/auth/login.ts'), SENS], [big, '301 lines changed (cap 300)'], [deleted, 'file deleted: src/old.ts'],
+    [removedTest, 'tests fell from the diff: 1 removed, 0 added'], [f('src/a.test.ts', "+it.skip('x', () => {})"), 'test skipped or narrowed in src/a.test.ts']]) {
+    assert.deepEqual(g.classify({ ...agentPr, files: [file] }), { risk: 'checked', reasons: [why], agentWhy: why }, why);
+  }
+  const all = g.classify({ ...agentPr, files: [f('src/auth/login.ts'), big, deleted, removedTest] });
+  assert.equal(all.risk, 'checked');
+  assert.deepEqual(all.reasons, [SENS, 'file deleted: src/old.ts', 'tests fell from the diff: 1 removed, 0 added', '303 lines changed (cap 300)']);
+  assert.equal(all.agentWhy, SENS);
+});
+
+test('#21 checked: every other agent-safe condition must still hold (each excluded, whichever file comes first)', () => {
+  const sens = f('src/auth/login.ts');
+  const excluded = {
+    'protected path': { files: [sens, f('.github/workflows/ci.yml')] },
+    'protected path first': { files: [f('AGENTS.md'), sens] },
+    'pivotal_paths file after': { files: [sens, f('src/routes/reveal/x.ts')] },
+    'pivotal_paths file before': { files: [f('src/routes/reveal/x.ts'), big] },
+    'sensitive and pivotal on one rename': { files: [f('src/routes/reveal/x.ts', '+x', { status: 'renamed', previous_filename: 'src/auth/x.ts' })] },
+    'dependency change': { files: [sens, f('package.json')] },
+    'package-manager config': { files: [deleted, f('.npmrc')] },
+    'deleted dependency file': { files: [f('requirements.txt', '', { status: 'removed' })] },
+    'issue not queued': { files: [sens], issue: { ...queued, labels: ['agent:claude'] } },
+    'issue pivotal': { files: [sens], issue: { ...queued, labels: ['ready', 'pivotal'] } },
+    'issue closed': { files: [sens], issue: { ...queued, state: 'closed' } },
+    'no linked issue': { files: [sens], issue: null },
+    'non-agent branch': { files: [sens], headRef: 'feature/7' },
+    'repo without agent_safe': { files: [sens], policy: g.parseOpsPolicy('sensitive_paths: ["src/auth/**"]\n') },
+    'agent_safe false with checked_tier true': { files: [sens], policy: g.parseOpsPolicy('agent_safe: false\nchecked_tier: true\nsensitive_paths: ["src/auth/**"]\n') },
+    'no .ops.yml (or a read error)': { files: [sens], policy: null },
+    'unreadable .ops.yml': { files: [sens], policy: g.parseOpsPolicy('agent_safe: true\nsensitive_paths:\n  - src/auth/**\nstray line\n') },
+    'hand-built policy without checkedTier': { files: [sens], policy: { agentSafe: true, maxLines: 300, sensitive: ['src/auth/**'], pivotal: [] } },
+    'dead-code label': { files: [deleted], labels: ['type:dead-code'] },
+    'dependabot author': { files: [big], author: 'dependabot[bot]' },
+  };
+  for (const [name, over] of Object.entries(excluded)) {
+    const r = g.classify({ ...agentPr, ...over });
+    assert.equal(r.risk, 'normal', name);
+    // ...and a check pass can never move it
+    assert.equal(g.decide({ ...agentPr, ...over, feedback: [codex('H'), checkV('H', 'pass')] }).state, 'pending', name);
+  }
+});
+
+test('#21 checked: reasons are an allowlist, so any other or future agent-safe reason is not checked', () => {
+  assert.deepEqual([...g.CHECKABLE_REASONS].sort(), ['deleted', 'sensitive', 'size', 'tests']);
+  // every code agentSafe can give today is either one of the four or excluded
+  const codes = (over) => g.agentSafe({ ...agentPr, ...over }).reasons.map((r) => r.code);
+  assert.deepEqual(codes({ files: [f('src/auth/a.ts'), f('src/routes/reveal/a.ts'), f('package.json'), deleted, removedTest, big] }),
+    ['sensitive', 'pivotal', 'dependency', 'deleted', 'tests', 'size']);
+  assert.deepEqual(codes({ headRef: 'feature/x' }), ['branch']);
+  assert.deepEqual(codes({ issue: null }), ['issue']);
+  assert.deepEqual(codes({ policy: null }), ['not-enabled']);
+  assert.deepEqual(codes({}), []);
+});
+
+test('#21 off switch: checked_tier: false in .ops.yml makes such PRs risk:normal as today; absent means on', () => {
+  const at = (ops) => g.classify({ ...agentPr, policy: g.parseOpsPolicy(ops), files: [f('src/auth/login.ts')] });
+  const S = 'agent_safe: true\nsensitive_paths: ["src/auth/**"]\n';
+  assert.equal(at(S).risk, 'checked');
+  assert.equal(at(`${S}checked_tier: true\n`).risk, 'checked');
+  const off = at(`${S}checked_tier: false   # owner wants to see these\n`);
+  assert.deepEqual(off, { risk: 'normal', reasons: [`code change src/auth/login.ts`, SENS], agentWhy: SENS });
+  assert.equal(g.decide({ ...agentPr, policy: g.parseOpsPolicy(`${S}checked_tier: false\n`), files: [f('src/auth/login.ts')], feedback: [codex('H'), checkV('H', 'pass')] }).description, `${WAIT} — ${SENS}`);
+  // false anywhere wins; anything but true/false switches the whole policy off (fail closed)
+  assert.equal(at(`checked_tier: false\n${S}checked_tier: true\n`).risk, 'normal');
+  for (const v of ['no', '"false"', 'False', 'off', '']) {
+    const p = g.parseOpsPolicy(`${S}checked_tier: ${v}\n`);
+    assert.equal(p.checkedTier, false, v);
+    assert.equal(p.agentSafe, false, v);
+  }
+  // the agent tier is unaffected by the switch
+  assert.equal(g.classify({ ...agentPr, policy: g.parseOpsPolicy('agent_safe: true\nchecked_tier: false\n') }).risk, 'agent');
+});
+
+test('#21 off switch: a PR cannot turn the tier on for itself (.ops.yml is a protected path; the policy is the default branch copy)', () => {
+  const opsChange = f('.ops.yml', '-checked_tier: false\n+checked_tier: true');
+  for (const p of [policyOff, policy]) {
+    const r = g.classify({ ...agentPr, policy: p, files: [f('src/auth/login.ts'), opsChange] });
+    assert.equal(r.risk, 'normal');
+    assert.equal(r.agentWhy, 'protected path .ops.yml');
+  }
+});
+
+test('#21 approved copies keep their precedence: an approved copy on an agent branch is risk:low, a near miss is risk:normal', () => {
+  const agentCopy = (head) => ({ ...agentPr, files: [f(COPY)], approvedCopies: LIST, copyContents: contentsOf({ [COPY]: { head } }) });
+  assert.deepEqual(g.classify(agentCopy(CALLER_TEXT)), { risk: 'low', reasons: [`approved copy of ${COPY}`], agentWhy: null });
+  const miss = g.classify(agentCopy(`${CALLER_TEXT}# x\n`));
+  assert.equal(miss.risk, 'normal');
+  assert.equal(miss.agentWhy, `protected path ${COPY}`);
+  // a copy alongside a sensitive file is not an approved copy, and the protected path keeps it out of risk:checked
+  assert.equal(g.classify({ ...agentCopy(CALLER_TEXT), files: [f(COPY), f('src/auth/login.ts')] }).risk, 'normal');
+});
+
+test('#21 checked: the status for each verdict, with the reason that put the PR in the tier', () => {
+  expectState(sensitivePr, 'pending', CK('waiting for the check of this commit'));
+  expectState(withFb(sensitivePr, checkV('H', 'pass')), 'success', CK('check passed and reviewed'));
+  expectState(withFb(sensitivePr, checkV('H', 'fail')), 'pending', CK('check found gaps'));
+  expectState(withFb(sensitivePr, checkV('H', 'unclear')), 'pending', CK('check unclear; waiting for human-approved'));
+  // human-approved on the head always passes it, whatever the check said
+  for (const v of [[], [checkV('H', 'fail')], [checkV('H', 'unclear')]]) {
+    expectState({ ...withFb(sensitivePr, ...v), ...approvedNow }, 'success', CK('human-approved and reviewed'));
+  }
+  // an approval for an older commit does not
+  expectState({ ...withFb(sensitivePr, checkV('H', 'unclear')), labels: ['human-approved'], labelEvents: [label('2026-11-06T09:00:00Z')] }, 'pending', CK('check unclear; waiting for human-approved'));
+  // every reason is named, shortened to fit
+  const d = g.decide({ ...withFb(sensitivePr, checkV('H', 'pass')), files: [f('src/auth/login.ts'), deleted, big] }).description;
+  assert.equal(d, CK('check passed and reviewed', `${SENS}; file deleted: src/old.ts; 302 lines changed (cap 300)`));
+  const many = g.decide({ ...withFb(sensitivePr, checkV('H', 'pass')), files: [f('src/auth/login.ts'), f('src/auth/logout.ts'), deleted, big] }).description;
+  assert.equal(many, CK('check passed and reviewed', `${SENS}; sensitive path src/auth/logout.ts; file deleted: src/old.ts; 303 lines changed (cap 300)`).slice(0, 139) + '…');
+  const long = g.decide({ ...sensitivePr, files: [f(`src/auth/${'deeply/'.repeat(20)}x.ts`)] }).description;
+  assert.ok(long.length <= 140 && long.startsWith('risk:checked: waiting for the check of this commit — sensitive path …') && long.endsWith('/x.ts'), long);
+  const r = g.decide(sensitivePr);
+  assert.deepEqual([r.risk, r.reasons, r.check], ['checked', [SENS], null]);
+});
+
+test('#21 checked: a pass needs a clean review of the head commit; the review rules are unchanged', () => {
+  const pass = checkV('H', 'pass');
+  expectState({ ...sensitivePr, feedback: [pass] }, 'pending', 'Waiting for a completed review of this commit');
+  expectState({ ...sensitivePr, feedback: [codex('H', null, 'running'), pass] }, 'pending', 'Waiting for a completed review of this commit');
+  expectState({ ...sensitivePr, feedback: [codex('H', true), pass] }, 'failure', UNRESOLVED);
+  expectState({ ...sensitivePr, labels: ['review:blocking'], feedback: [codex('H'), pass] }, 'failure', UNRESOLVED);
+  expectState({ ...sensitivePr, draft: true, feedback: [codex('H'), pass] }, 'pending', 'Draft PR');
+  // an owner-account review-verdict still never counts as the review
+  expectState({ ...sensitivePr, feedback: [claudeVerdict('H', 'clear', OWNER), pass] }, 'pending', 'Waiting for a completed review of this commit');
+  expectState({ ...sensitivePr, feedback: [claudeVerdict('H', 'clear', ACTIONS_BOT), pass] }, 'pending', 'Waiting for a completed review of this commit');
+  expectState({ ...sensitivePr, feedback: [claudeVerdict('H', 'clear'), pass] }, 'success', CK('check passed and reviewed'));
+  // a Codex PR still needs the Claude second review
+  expectState({ ...sensitivePr, headRef: 'codex/7', feedback: [codex('H'), pass] }, 'pending', 'Codex PR: waiting for the Claude review of this commit');
+  expectState({ ...sensitivePr, headRef: 'codex/7', feedback: [codex('H'), pass, verdictBy('claude[bot]', 'H', 'clear')] }, 'success', CK('check passed and reviewed'));
+  // review:override by the owner overrules findings as for risk:agent; the check is still needed
+  const ov = { labels: ['review:override'], labelEvents: [{ event: 'labeled', label: 'review:override', actor: OWNER, viaApp: false, at: '2026-11-06T10:05:00Z' }] };
+  expectState({ ...sensitivePr, ...ov, feedback: [codex('H', true)] }, 'pending', CK('waiting for the check of this commit'));
+  expectState({ ...sensitivePr, ...ov, feedback: [codex('H', true), pass] }, 'success', CK('check passed; review findings overridden by owner'));
+});
+
+test('#21 markers: only the owner\'s account or github-actions[bot] count, only in PR conversation comments', () => {
+  const s = (v) => g.decide(withFb(sensitivePr, v)).state;
+  assert.equal(s(checkV('H', 'pass', { author: OWNER })), 'success');
+  assert.equal(s(checkV('H', 'pass', { author: ACTIONS_BOT })), 'success');
+  for (const author of ['someone', 'claude[bot]', CODEX_BOT, 'dependabot[bot]', '']) assert.equal(s(checkV('H', 'pass', { author })), 'pending', author);
+  // a review body or a line comment carrying the marker does not count
+  const { kind, ...review } = checkV('H', 'pass', { author: OWNER });
+  assert.equal(kind, 'comment');
+  assert.equal(s({ ...review, commitId: 'H' }), 'pending');
+  assert.equal(s({ ...review, commitId: 'H', id: 77, originalCommitId: 'H' }), 'pending');
+  // no owner known: only github-actions[bot]
+  assert.equal(g.decide({ ...withFb(sensitivePr, checkV('H', 'pass', { author: OWNER })), owner: undefined }).state, 'pending');
+});
+
+test('#21 markers: only a verdict for the head commit counts; malformed markers count as none', () => {
+  const c = (...v) => g.checkVerdict({ ...sensitivePr, feedback: v });
+  assert.equal(c(checkV('H', 'pass')), 'pass');
+  assert.equal(c(checkV('OLD', 'pass')), null);
+  assert.equal(c(checkV('h', 'pass')), null);
+  assert.equal(c(checkV('H', 'pass', { body: '<!--check-verdict:v1{"commit_sha":"H","result":"pass"}-->' })), 'pass');
+  for (const body of [
+    '<!-- check-verdict:v1 {"commit_sha":"H","result":"pass" -->',
+    '<!-- check-verdict:v1 {commit_sha:"H",result:"pass"} -->',
+    '<!-- check-verdict:v1 ["H","pass"] -->',
+    '<!-- check-verdict:v1 {"result":"pass"} -->',
+    '<!-- check-verdict:v1 {"commit_sha":null,"result":"pass"} -->',
+    '<!-- check-verdict:v2 {"commit_sha":"H","result":"pass"} -->',
+    '<!-- check-verdict:v1 {"commit_sha":"H","result":"pass"}',
+    'check-verdict:v1 {"commit_sha":"H","result":"pass"}',
+    '',
+  ]) assert.equal(c(checkV('H', 'pass', { body })), null, body);
+  // a malformed newer marker leaves the older valid one standing
+  assert.equal(c(checkV('H', 'fail', { at: '2026-11-06T10:00:00Z' }), checkV('H', 'pass', { body: '<!-- check-verdict:v1 {"commit_sha":"H",} -->' })), 'fail');
+  // an unknown result value is unclear, never a pass
+  for (const result of ['PASS', 'passed', 'ok', 'none-stand', '']) assert.equal(c(checkV('H', result)), 'unclear', result);
+  assert.equal(c(checkV('H', 'pass', { body: '<!-- check-verdict:v1 {"commit_sha":"H","result":true} -->' })), 'unclear');
+  expectState(withFb(sensitivePr, checkV('H', 'maybe')), 'pending', CK('check unclear; waiting for human-approved'));
+  // a new commit clears every verdict
+  expectState({ ...withFb(sensitivePr, checkV('H', 'pass')), headSha: 'H2', feedback: [codex('H2'), checkV('H', 'pass')] }, 'pending', CK('waiting for the check of this commit'));
+});
+
+test('#21 markers: the newest verdict wins; ties and unknown times are unclear', () => {
+  const c = (...v) => g.checkVerdict({ ...sensitivePr, feedback: v });
+  const at = (t) => ({ at: `2026-11-06T${t}:00Z` });
+  assert.equal(c(checkV('H', 'fail', at('10:00')), checkV('H', 'pass', at('11:00'))), 'pass');
+  assert.equal(c(checkV('H', 'pass', at('11:00')), checkV('H', 'fail', at('10:00'))), 'pass');
+  assert.equal(c(checkV('H', 'pass', at('10:00')), checkV('H', 'fail', at('11:00'))), 'fail');
+  assert.equal(c(checkV('H', 'pass', at('10:00')), checkV('H', 'unclear', at('11:00'))), 'unclear');
+  // an edited comment is as new as its edit
+  assert.equal(c(checkV('H', 'fail', at('10:30')), { ...checkV('H', 'pass', at('10:00')), updatedAt: '2026-11-06T11:00:00Z' }), 'pass');
+  assert.equal(c(checkV('H', 'pass', at('11:00')), checkV('H', 'fail', at('11:00'))), 'unclear');
+  assert.equal(c(checkV('H', 'pass', at('11:00')), checkV('H', 'fail', { at: 'not a time' })), 'unclear');
+  assert.equal(c(checkV('H', 'pass', { at: '' }), checkV('H', 'pass', { at: '' })), 'pass');
+  assert.equal(c(checkV('H', 'pass', { at: '' }), checkV('H', 'fail', at('11:00'))), 'unclear');
+  // a verdict for another commit never takes part
+  assert.equal(c(checkV('H', 'pass', at('10:00')), checkV('OLD', 'fail', at('11:00'))), 'pass');
+});
+
+const M = '<!-- check-verdict:v1 {"commit_sha":"H","result":"pass"} -->';
+const RM = '<!-- ruling-verdict:v1 {"commit_sha":"H","result":"none-stand"} -->';
+const BT = '`';
+// The check verdict read from one comment by the owner's account.
+const checkOf = (body, author = OWNER) => g.checkVerdict({ ...sensitivePr, feedback: [checkV('H', 'pass', { author, body })] });
+// The ruling read from one comment: the same markerLine path.
+const rulingOf = (body) => g.decide({ ...base, feedback: [codex('H', true), ...sixAnswered, rulingV('H', 'none-stand', { body })] }).ruling;
+// Each body must carry no marker, for both kinds, and must not pass a reviewed risk:checked PR.
+const noMarker = (body, why) => {
+  assert.equal(checkOf(body), null, `check: ${why}`);
+  // the same body as a ruling (every check marker renamed): must carry none either
+  assert.equal(rulingOf(body.split(M).join(RM).split('check-verdict:v1').join('ruling-verdict:v1')), null, `ruling: ${why}`);
+  expectState(withFb(sensitivePr, checkV('H', 'pass', { author: OWNER, body })), 'pending', CK('waiting for the check of this commit'));
+};
+
+test('#21 markers: the marker on the first line, alone, counts whatever follows (check and ruling)', () => {
+  const body = `${M}\n\nChecked against the issue: \`npm test\` passes and the ${BT}login${BT} flow is covered.\n\n- one\n- two\n\n${BT.repeat(3)}\nlog\n${BT.repeat(3)}\n\n> quoted\n<pre>x</pre>\nSee ${BT}this`;
+  assert.equal(checkOf(body), 'pass');
+  assert.equal(rulingOf(body.split(M).join(RM)), 'none-stand');
+  expectState(withFb(sensitivePr, checkV('H', 'pass', { author: OWNER, body })), 'success', CK('check passed and reviewed'));
+  expectState({ ...base, feedback: [codex('H', true), ...sixAnswered, rulingV('H', 'none-stand', { body: body.split(M).join(RM) })] }, 'pending', `${WAIT} — ${NO_TIER}`);
+  // up to three leading spaces and trailing spaces or tabs; CRLF; a leading byte-order mark; the marker as the whole body
+  for (const b of [`   ${M}  \t`, `${M}\r\nDone.\r\n`, `${M}\rDone.`, `﻿${M}\nDone.`, M, '<!--check-verdict:v1{"commit_sha":"H","result":"pass"}-->']) {
+    assert.equal(checkOf(b), 'pass', JSON.stringify(b));
+    assert.equal(rulingOf(b.split(M).join(RM).split('check-verdict:v1').join('ruling-verdict:v1').replace('"pass"', '"none-stand"')), 'none-stand', JSON.stringify(b));
+  }
+});
+
+test('#21 markers: a marker anywhere but the first line carries nothing', () => {
+  noMarker(`\n${M}`, 'leading blank line');
+  noMarker(`\r\n${M}`, 'leading blank CRLF line');
+  noMarker(` \n${M}`, 'leading whitespace-only line');
+  noMarker(`Checked.\n\n${M}`, 'after prose');
+  noMarker(`Done.\r\n\r\n${M}\r\n`, 'after prose, CRLF');
+  noMarker(`<!-- note -->\n${M}`, 'after a closed HTML comment');
+  noMarker(`> quoted text\n\n${M}`, 'after a quote');
+  noMarker(`${BT.repeat(3)}\nold: x\n${BT.repeat(3)}\n${M}`, 'after a closed fence');
+  noMarker(`﻿﻿${M}`, 'two byte-order marks');
+  noMarker(` ${M}`, 'a non-breaking space before it');
+});
+
+test('#21 markers: Codex reproduction, a fence inside a list item, does not pass the PR (check and ruling)', () => {
+  const repro = (marker) => `- ~~~\n${marker}\n    ~~~`;
+  noMarker(repro(M), 'list fence');
+  // the ruling: an answered risk:checked PR with a passing check stays waiting for human-approved
+  const checkedAnswered = { ...sensitivePr, feedback: [codex('H', true), ...sixAnswered, checkV('H', 'pass'), rulingV('H', 'none-stand', { body: repro(RM) })] };
+  expectState(checkedAnswered, 'pending', CK('waiting for human-approved — reviewer findings answered, not resolved'));
+  assert.equal(g.decide(checkedAnswered).ruling, null);
+});
+
+test('#21 markers: Codex reproduction, an inline code span over several lines, does not pass the PR', () => {
+  const repro = `${BT}\nexample ${M}\n${BT}`;
+  noMarker(repro, 'codex reproduction');
+  // the marker alone on its line, still inside the span
+  noMarker(`${BT}\n${M}\n${BT}`, 'alone inside a one-backtick span');
+  noMarker(`Text ${BT.repeat(2)} starts\n${M}\nends ${BT.repeat(2)} here`, 'inside a two-backtick span');
+  // a run of a different length does not close the span
+  noMarker(`${BT.repeat(2)}\n${BT}\n${M}\n${BT.repeat(2)}`, 'one backtick inside a two-backtick span');
+});
+
+test('#21 markers: a marker in or after an open or ambiguous code span carries nothing', () => {
+  noMarker(`Open ${BT}span\n\n${M}`, 'span open at a blank line');
+  noMarker(`Open ${BT.repeat(2)} span\n${M}`, 'span open at the end, before the marker');
+  noMarker(`${BT.repeat(3)}\n${M}`, 'unclosed fence');
+  noMarker(`${BT.repeat(4)}\n${BT.repeat(3)}\n${M}\n${BT.repeat(3)}\n`, 'shorter fence inside a longer one');
+  noMarker(`~~~md\n${M}\n~~~`, 'tilde fence');
+});
+
+test('#21 markers: a marker counts only alone on its line', () => {
+  for (const body of [
+    `example ${M}`, `${M} done`, `${M}${M.replace('pass', 'fail')}`, `<!-- x --> ${M}`, `${BT}${M}${BT}`,
+    `- ${M}`, `* ${M}`, `1. ${M}`, `# ${M}`, `| ${M} |`, `**${M}**`,
+    `    ${M}`, `\t${M}`,
+    M.replace('-->', ''), `<!-- check-verdict:v1 {"commit_sha":"H","result":"pass","x":"-->"} -->`,
+    `${M}\n${M.replace('pass', 'fail')}`, `${M}\nFor reference: check-verdict:v1`,
+  ]) noMarker(body, body);
+});
+
+test('#21 markers: quotes, HTML comments, <pre>/<code> and list code never carry a marker', () => {
+  // block quotes, including a lazy continuation line with no `>`
+  noMarker(`> ${M}`, 'quote');
+  noMarker(`  > > ${M}`, 'nested quote');
+  noMarker(`> Earlier result:\n${M}`, 'lazy quote continuation');
+  noMarker(`> Earlier result:\nand more\n${M}\n`, 'lazy quote continuation, third line');
+  // an HTML comment that wraps the marker, on one line or several
+  noMarker(`<!-- note ${M} -->`, 'wrapped on one line');
+  noMarker(`<!--\n${M}\n-->`, 'wrapped over lines');
+  noMarker(`<!-- old notes\n\n${M}\n-->`, 'wrapped across a blank line');
+  // raw <pre> or <code> HTML, over several lines (any such tag: none)
+  noMarker(`<pre>\n${M}\n</pre>`, 'pre');
+  noMarker(`<code>\n${M}\n</code>`, 'code');
+  noMarker(`<PRE class="x">\n\n${M}\n\n</PRE>`, 'pre with blank lines');
+  noMarker(`Result:\n\n${M}\n\n<details><pre>log</pre></details>`, 'pre anywhere in the comment');
+  // indented code after a list item
+  noMarker(`- item\n\n      ${M}`, 'indented code in a list item');
+  noMarker(`1. item\n\n        ${M}`, 'indented code in an ordered list item');
+  noMarker(`- item\n    ${M}`, 'list continuation indented four');
+});
+
+test('#21 rulings: none-stand lets answered findings proceed by their own tier', () => {
+  const checkedAnswered = { ...sensitivePr, feedback: [codex('H', true), ...sixAnswered] };
+  // risk:checked, no ruling: waits for human-approved as risk:normal does today
+  expectState(checkedAnswered, 'pending', CK('waiting for human-approved — reviewer findings answered, not resolved'));
+  expectState(withFb(checkedAnswered, checkV('H', 'pass')), 'pending', CK('waiting for human-approved — reviewer findings answered, not resolved'));
+  expectState({ ...checkedAnswered, ...approvedNow }, 'success', CK('human-approved and reviewed'));
+  // with a none-stand ruling it proceeds as risk:checked
+  const ruled = withFb(checkedAnswered, rulingV('H', 'none-stand'));
+  expectState(ruled, 'pending', CK('waiting for the check of this commit'));
+  expectState(withFb(ruled, checkV('H', 'pass')), 'success', CK('check passed; no reviewer finding stands'));
+  expectState(withFb(ruled, checkV('H', 'fail')), 'pending', CK('check found gaps'));
+  // risk:normal: no longer waits on the answered findings, only on its tier
+  const d = expectState(withFb(answeredPr, rulingV('H', 'none-stand', { author: OWNER })), 'pending', `${WAIT} — ${NO_TIER}`);
+  assert.deepEqual([d.review, d.ruling, d.settled], ['answered', 'none-stand', true]);
+  expectState({ ...withFb(answeredPr, rulingV('H', 'none-stand')), ...approvedNow }, 'success', 'human-approved and reviewed');
+  // unclear, a ruling for another commit, by another account, or none: today's behaviour
+  for (const r of [rulingV('H', 'unclear'), rulingV('OLD', 'none-stand'), rulingV('H', 'none-stand', { author: 'someone' }), rulingV('H', 'maybe'), rulingV('H', 'none-stand', { body: '> <!-- ruling-verdict:v1 {"commit_sha":"H","result":"none-stand"} -->' })]) {
+    expectState(withFb(answeredPr, r), 'pending', `${ANSWERED_WAIT} — ${NO_TIER}`);
+    expectState(withFb(withFb(checkedAnswered, checkV('H', 'pass')), r), 'pending', CK('waiting for human-approved — reviewer findings answered, not resolved'));
+  }
+});
+
+test('#21 rulings: risk:low and risk:agent with answered findings fail as today, ruling or not', () => {
+  for (const pr of [{ ...agentPr, feedback: answeredPr.feedback }, { ...answeredPr, files: [f('README.md')] }]) {
+    expectState(withFb(pr, rulingV('H', 'none-stand')), 'failure', UNRESOLVED);
+  }
+});
+
+test('#21 rulings: stands is a failure until a new commit', () => {
+  const STANDS = 'Ruling for this commit: a reviewer finding stands';
+  expectState(withFb(answeredPr, rulingV('H', 'stands')), 'failure', STANDS);
+  expectState({ ...withFb(answeredPr, rulingV('H', 'stands')), ...approvedNow }, 'failure', STANDS);
+  // a later none-stand for the same commit does not replace it
+  expectState(withFb(answeredPr, rulingV('H', 'stands', { at: '2026-11-06T10:00:00Z' }), rulingV('H', 'none-stand')), 'failure', STANDS);
+  // in every tier
+  expectState(withFb(withFb(sensitivePr, checkV('H', 'pass')), rulingV('H', 'stands')), 'failure', STANDS);
+  expectState(withFb(agentPr, rulingV('H', 'stands', { author: OWNER })), 'failure', STANDS);
+  // a new commit clears it
+  expectState({ ...answeredPr, headSha: 'H2', feedback: [codex('H2', true), ...sixAnswered, rulingV('H', 'stands')] }, 'pending', `${ANSWERED_WAIT} — ${NO_TIER}`);
+  // from another account it is ignored
+  expectState(withFb(answeredPr, rulingV('H', 'stands', { author: 'someone' })), 'pending', `${ANSWERED_WAIT} — ${NO_TIER}`);
+});
+
+test('#21 rulings: a finding raised on the head commit blocks unless the ruling for that head covers it', () => {
+  // Codex raised finding 7 on the head at 10:00 and the owner replied at 10:10.
+  const onHead = [codex('H', true), ...sixAnswered, cFinding(7, 'H', '2026-11-06T10:00:00Z'), cReply(7, { at: '2026-11-06T10:10:00Z' })];
+  expectState({ ...base, feedback: onHead }, 'failure', UNRESOLVED);
+  // a none-stand ruling written after every Codex finding covers it
+  expectState({ ...base, feedback: [...onHead, rulingV('H', 'none-stand', { at: '2026-11-06T10:20:00Z' })] }, 'pending', `${WAIT} — ${NO_TIER}`);
+  expectState({ ...sensitivePr, feedback: [...onHead, rulingV('H', 'none-stand'), checkV('H', 'pass')] }, 'success', CK('check passed; no reviewer finding stands'));
+  // written before the finding (or at the same time), it does not
+  expectState({ ...base, feedback: [...onHead, rulingV('H', 'none-stand', { at: '2026-11-06T09:50:00Z' })] }, 'failure', UNRESOLVED);
+  expectState({ ...base, feedback: [...onHead, rulingV('H', 'none-stand', { at: '2026-11-06T10:00:00Z' })] }, 'failure', UNRESOLVED);
+  // a Codex comment after the ruling, in any thread, means the ruling covers nothing
+  const later = { ...cReply(1, { author: CODEX_BOT, id: 3001, commit: 'C9', at: '2026-11-06T11:30:00Z' }), body: 'Still an issue.' };
+  expectState({ ...base, feedback: [...onHead, rulingV('H', 'none-stand'), later, cReply(1, { id: 4001, at: '2026-11-06T11:40:00Z' })] }, 'failure', UNRESOLVED);
+  // the owner must still have replied after Codex in that thread
+  expectState({ ...base, feedback: [...onHead.filter((x) => x.id !== 1007), rulingV('H', 'none-stand')] }, 'failure', UNRESOLVED);
+  // a Codex review of the head carrying a finding badge: covered only if older than the ruling, and only with a time
+  const review = { author: CODEX_BOT, commitId: 'H', body: '![P2 Badge](https://img.shields.io/badge/P2-yellow) General finding', createdAt: '2026-11-06T10:05:00Z' };
+  expectState({ ...base, feedback: [...onHead, review, rulingV('H', 'none-stand')] }, 'pending', `${WAIT} — ${NO_TIER}`);
+  expectState({ ...base, feedback: [...onHead, { ...review, createdAt: '2026-11-06T11:05:00Z' }, rulingV('H', 'none-stand')] }, 'failure', UNRESOLVED);
+  expectState({ ...base, feedback: [...onHead, { ...review, createdAt: undefined }, rulingV('H', 'none-stand')] }, 'failure', UNRESOLVED);
+  // a ruling with no readable time covers nothing
+  expectState({ ...base, feedback: [...onHead, rulingV('H', 'none-stand', { at: '' })] }, 'failure', UNRESOLVED);
+  // another reviewer's P0/P1 on the head is never covered by a ruling
+  const p0 = { author: 'claude[bot]', commitId: 'H', body: '![P0 Badge](https://img.shields.io/badge/P0-red) broken', createdAt: '2026-11-06T09:00:00Z' };
+  expectState({ ...base, feedback: [...onHead, p0, rulingV('H', 'none-stand')] }, 'failure', UNRESOLVED);
+  // risk:agent with a covered head finding still fails, as today
+  expectState({ ...agentPr, feedback: [...onHead, rulingV('H', 'none-stand')] }, 'failure', UNRESOLVED);
+  assert.equal(g.rulingCovers({ feedback: onHead, headSha: 'H' }, Date.parse('2026-11-06T10:20:00Z')), true);
+  assert.equal(g.rulingCovers({ feedback: onHead, headSha: 'H' }, NaN), false);
 });

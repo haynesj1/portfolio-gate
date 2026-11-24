@@ -4,15 +4,17 @@
 # Only triggers that run the DEFAULT-BRANCH copy of this file are used
 # (pull_request_target, issue_comment, issues, push to the default branch), so a PR cannot change the gate that
 # judges it. Reviews are detected through comments: Codex edits its summary
-# comment; the Claude reviewer posts a review-verdict comment.
+# comment; the Claude reviewer posts a review-verdict comment; the check and the
+# ruling (risk:checked tier) post check-verdict and ruling-verdict comments.
 name: pr-gate
 
 on:
   pull_request_target:
     # edited: the PR body can carry the linked issue (`Closes #n`) for the agent-safe tier.
     types: [opened, edited, synchronize, reopened, labeled, unlabeled, ready_for_review, converted_to_draft]
+  # deleted: removing the comment that carried a verdict must withdraw its pass.
   issue_comment:
-    types: [created, edited]
+    types: [created, edited, deleted]
   # The agent-safe tier depends on the linked issue (open, queued, not pivotal),
   # so changes to it re-evaluate the PRs that implement it.
   issues:
@@ -33,20 +35,24 @@ permissions:
 jobs:
   evaluate:
     # Comments only matter to the gate when they carry a review result: a Codex
-    # review summary (any state) or a Claude review-verdict. Other comments
+    # review summary (any state), a Claude review-verdict, a check-verdict or a
+    # ruling-verdict. Other comments
     # (replies, PR summaries, triage notes) are skipped, and a skipped job uses no
     # Actions minutes. Codex summaries always evaluate, whatever their status or
     # JSON spacing: the gate's own parser decides what they mean, so this filter
     # can never hide a review result. PR events (opened, push, ready, draft)
     # always evaluate, with two exceptions. A label change is skipped unless the
     # label is one the gate reads or writes (human-approved, review:override,
-    # review:blocking, type:dead-code, risk:low, risk:agent, risk:normal); adding
+    # review:blocking, type:dead-code, risk:low, risk:agent, risk:checked,
+    # risk:normal); adding
     # and removing are treated alike, and an event with no label name evaluates.
     # A PR edit is skipped only when it changed the title and nothing else (no
     # body, no base branch) and the author is not Dependabot, whose title the gate
     # reads. Any other edit evaluates, including a body edit from an empty body.
     # An edit that removes a review result also evaluates (the previous
-    # body is checked too), so withdrawn evidence is recomputed at once.
+    # body is checked too), and so does deleting a comment that carried one
+    # (a deleted event's payload still holds the comment body), so withdrawn
+    # evidence is recomputed at once.
     # Issue events evaluate only when they can change the agent-safe tier: the
     # issue closed or reopened, or its ready / in-progress / pivotal label changed.
     # Tested in gate/workflow.test.js ("caller comment filter" and "caller PR filter").
@@ -59,7 +65,7 @@ jobs:
           github.event.label.name != 'human-approved' && github.event.label.name != 'review:override' &&
           github.event.label.name != 'review:blocking' && github.event.label.name != 'type:dead-code' &&
           github.event.label.name != 'risk:low' && github.event.label.name != 'risk:agent' &&
-          github.event.label.name != 'risk:normal') ||
+          github.event.label.name != 'risk:checked' && github.event.label.name != 'risk:normal') ||
          (github.event.action == 'edited' && github.event.changes.title &&
           !github.event.changes.body && !github.event.changes.base &&
           github.event.pull_request.user.login &&
@@ -71,8 +77,12 @@ jobs:
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
        (contains(github.event.comment.body, 'review-verdict:v1') ||
         contains(github.event.comment.body, 'codex-review-state:v1') ||
+        contains(github.event.comment.body, 'check-verdict:v1') ||
+        contains(github.event.comment.body, 'ruling-verdict:v1') ||
         contains(github.event.changes.body.from, 'review-verdict:v1') ||
-        contains(github.event.changes.body.from, 'codex-review-state:v1')))
+        contains(github.event.changes.body.from, 'codex-review-state:v1') ||
+        contains(github.event.changes.body.from, 'check-verdict:v1') ||
+        contains(github.event.changes.body.from, 'ruling-verdict:v1')))
     # One evaluation per PR at a time; a newer one cancels an older one. Set on the
     # job, not the workflow, so a skipped comment run never cancels a real one.
     concurrency:
