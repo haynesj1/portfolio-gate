@@ -1353,3 +1353,88 @@ test('#21 rulings: a finding raised on the head commit blocks unless the ruling 
   assert.equal(g.rulingCovers({ feedback: onHead, headSha: 'H' }, Date.parse('2026-11-06T10:20:00Z')), true);
   assert.equal(g.rulingCovers({ feedback: onHead, headSha: 'H' }, NaN), false);
 });
+
+// ---- #26: a pivotal_paths or sensitive_paths file is never risk:low ---------
+const LISTS = `sensitive_paths:
+  - "src/auth/**"
+  - docs/security/
+pivotal_paths:
+  - "docs/journey/**"
+  - src/routes/reveal/
+`;
+const listsOnly = g.parseOpsPolicy(LISTS); // agent_safe off
+const listsAgent = g.parseOpsPolicy(`agent_safe: true\n${LISTS}`);
+const addedTest = (name) => f(name, "+it('works', () => { expect(1).toBe(1) })", { status: 'added' });
+
+test('#26: Markdown under pivotal_paths is risk:normal with "pivotal path <name>", whatever the tier policy', () => {
+  for (const p of [listsOnly, listsAgent]) {
+    for (const pr of [{ ...base, headRef: 'feature/x' }, { ...agentPr }]) {
+      const r = g.classify({ ...pr, policy: p, files: [f('docs/journey/welcome.md'), addedTest('src/a.test.ts')] });
+      assert.deepEqual(r, { risk: 'normal', reasons: ['pivotal path docs/journey/welcome.md'], agentWhy: 'pivotal path docs/journey/welcome.md' });
+    }
+  }
+  const d = g.decide({ ...base, policy: listsOnly, files: [f('docs/journey/welcome.md')] });
+  assert.equal(d.state, 'pending');
+  assert.equal(d.description, `${WAIT} — pivotal path docs/journey/welcome.md`);
+  // an added test under a pivotal path too
+  assert.equal(g.classify({ ...base, policy: listsOnly, files: [addedTest('src/routes/reveal/page.test.ts')] }).risk, 'normal');
+});
+
+test('#26: an added test under sensitive_paths is never risk:low (checked or normal by the existing rules)', () => {
+  const files = [addedTest('src/auth/login.test.ts')];
+  assert.equal(g.classify({ ...base, policy: listsOnly, files }).risk, 'normal');
+  assert.match(g.classify({ ...base, policy: listsOnly, files }).reasons.join('\n'), /sensitive path src\/auth\/login\.test\.ts/);
+  const checked = g.classify({ ...agentPr, policy: listsAgent, files });
+  assert.deepEqual(checked, { risk: 'checked', reasons: ['sensitive path src/auth/login.test.ts'], agentWhy: 'sensitive path src/auth/login.test.ts' });
+  assert.equal(g.classify({ ...agentPr, policy: { ...listsAgent, checkedTier: false }, files }).risk, 'normal');
+  // docs under a sensitive path, too
+  assert.equal(g.classify({ ...base, policy: listsOnly, files: [f('docs/security/keys.md')] }).risk, 'normal');
+  assert.equal(g.classify({ ...agentPr, policy: listsAgent, files: [f('docs/security/keys.md')] }).risk, 'checked');
+});
+
+test('#26: docs and added tests outside both lists are still risk:low', () => {
+  for (const p of [listsOnly, listsAgent]) {
+    const r = g.classify({ ...agentPr, policy: p, files: [f('README.md'), f('docs/guide.md'), addedTest('src/app.test.ts'), f('docs/journey.md')] });
+    assert.deepEqual(r, { risk: 'low', reasons: ['docs', 'tests added'], agentWhy: null });
+  }
+});
+
+test('#26: a rename is checked on both its old and new path', () => {
+  const mv = (from, to) => f(to, '', { status: 'renamed', previous_filename: from, additions: 0 });
+  // into and out of a pivotal path
+  assert.deepEqual(g.classify({ ...base, policy: listsOnly, files: [mv('docs/old.md', 'docs/journey/new.md')] }).reasons, ['pivotal path docs/journey/new.md']);
+  assert.deepEqual(g.classify({ ...base, policy: listsOnly, files: [mv('docs/journey/old.md', 'docs/new.md')] }).reasons, ['pivotal path docs/journey/old.md']);
+  // into and out of a sensitive path
+  assert.equal(g.classify({ ...base, policy: listsOnly, files: [mv('docs/old.md', 'docs/security/new.md')] }).risk, 'normal');
+  assert.equal(g.classify({ ...agentPr, policy: listsAgent, files: [mv('docs/security/old.md', 'docs/new.md')] }).risk, 'checked');
+  // outside both lists, a docs rename stays low
+  assert.equal(g.classify({ ...base, policy: listsOnly, files: [mv('docs/old.md', 'docs/new.md')] }).risk, 'low');
+});
+
+test('#26: no .ops.yml, an empty or unrelated policy, or empty lists behave as before', () => {
+  const files = [f('docs/journey/welcome.md'), addedTest('src/auth/login.test.ts')];
+  for (const p of [null, undefined, g.parseOpsPolicy(''), g.parseOpsPolicy('app: x'), g.parseOpsPolicy('sensitive_paths: []\npivotal_paths: []\n'), { agentSafe: true, maxLines: 400, checkedTier: true }]) {
+    assert.deepEqual(g.classify({ ...base, policy: p, files }), { risk: 'low', reasons: ['docs', 'tests added'], agentWhy: null }, JSON.stringify(p));
+  }
+});
+
+test('#26: dead-code removal under a listed path is not risk:low', () => {
+  const labels = ['type:dead-code'];
+  const del = (name) => f(name, '-old', { additions: 0 });
+  assert.equal(g.classify({ ...base, labels, policy: listsOnly, files: [del('src/a.ts')] }).risk, 'low');
+  assert.deepEqual(g.classify({ ...base, labels, policy: listsOnly, files: [del('src/routes/reveal/a.ts')] }).reasons, ['pivotal path src/routes/reveal/a.ts']);
+  assert.equal(g.classify({ ...base, labels, policy: listsOnly, files: [del('src/auth/a.ts')] }).risk, 'normal');
+  assert.equal(g.classify({ ...agentPr, labels, policy: listsAgent, files: [del('src/auth/a.ts')] }).risk, 'checked');
+});
+
+test('#26: approved copies and Dependabot patch bumps are unchanged by the lists', () => {
+  // An approved copy stays risk:low even when its path is listed: its content is approved by hash.
+  const listed = g.parseOpsPolicy(`pivotal_paths: ["${COPY}"]\nsensitive_paths: ["${DOC}"]\n`);
+  const r = g.classify({ ...copyInput([f(COPY), f(DOC)], { [COPY]: { head: CALLER_TEXT }, [DOC]: { head: HEAD_DOC, base: BASE_DOC } }), policy: listed });
+  assert.deepEqual(r, { risk: 'low', reasons: [`approved copy of ${COPY}`, `approved copy of ${DOC}`], agentWhy: null });
+  // A near miss is still a protected path, risk:normal.
+  assert.equal(g.classify({ ...copyInput([f(COPY)], { [COPY]: { head: 'other' } }), policy: listed }).risk, 'normal');
+  // Dependabot patch bumps are decided before the lists are read.
+  const dep = { ...base, author: 'dependabot[bot]', title: 'Bump a from 1.2.3 to 1.2.4', commitAuthors: ['dependabot[bot]'], files: [f('package.json')] };
+  assert.equal(g.classify({ ...dep, policy: g.parseOpsPolicy('pivotal_paths: ["package.json"]\n') }).risk, 'low');
+});

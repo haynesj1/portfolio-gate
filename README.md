@@ -7,10 +7,12 @@ A merge gate for repositories where AI coding agents open pull requests. It sets
 
 | Tier (label) | What puts a PR there | What passes it, once reviewed |
 |---|---|---|
-| `risk:low` | docs, added tests, Dependabot patch bumps, deletion-only dead-code removal, approved copies of shared files | nothing more |
+| `risk:low` | docs, added tests, Dependabot patch bumps, deletion-only dead-code removal, approved copies of shared files; never a PR that touches a `pivotal_paths` or `sensitive_paths` file (see below) | nothing more |
 | `risk:agent` | an agent PR that meets every agent-safe rule (opt-in per repo, see below) | nothing more |
 | `risk:checked` | an agent PR kept out of `risk:agent` **only** by its size, a `sensitive_paths` file, a deleted file, or a removed or skipped test (see below) | a `check-verdict` of `pass` for the head commit, or `human-approved` on it |
-| `risk:normal` | everything else | the owner's `human-approved` label on this exact commit |
+| `risk:normal` | everything else, including any PR that touches a `pivotal_paths` file | the owner's `human-approved` label on this exact commit |
+
+The `.ops.yml` lists (on the default branch) apply before `risk:low` is decided, on both the old and new path of a rename. A PR that changes any `pivotal_paths` file is `risk:normal` whatever the file type, with the reason `pivotal path <name>`. A PR that changes any `sensitive_paths` file is never `risk:low`: it is `risk:checked` or `risk:normal` by the rules below. With no `.ops.yml`, or empty lists, nothing changes. Two cases are decided before the lists are read and are unchanged: approved copies (their content is approved by hash, and every listed copy is a protected path anyway) and Dependabot patch bumps of manifests.
 
 ## Answered findings wait for `human-approved`
 

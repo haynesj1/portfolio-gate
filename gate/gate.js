@@ -382,21 +382,27 @@ function classify({ author, title, labels, files, commitAuthors = [], headRef, p
       ? { risk: 'low', reasons: ['dependency patch bump (Dependabot commits, manifests only)'], agentWhy: null }
       : { risk: 'normal', reasons: ['dependency change that is not a pure Dependabot patch bump'], agentWhy: 'dependency change that is not a pure Dependabot patch bump' };
   }
+  // `.ops.yml` lists (issue #26), checked on both paths of a rename. A
+  // pivotal_paths file is risk:normal whatever its type; a sensitive_paths file
+  // is never risk:low and falls to risk:checked or risk:normal below.
+  const names = files.flatMap(pathsOf);
+  const pivotal = names.filter((n) => matchesAny(n, policy?.pivotal || [])).map((n) => `pivotal path ${n}`);
+  if (pivotal.length) return { risk: 'normal', reasons: pivotal, agentWhy: pivotal[0] };
+  const sensitive = names.filter((n) => matchesAny(n, policy?.sensitive || [])).map((n) => `sensitive path ${n}`);
   if (labels.includes('type:dead-code')) {
     const onlyDeletes = files.every((f) => f.status !== 'removed' && f.additions === 0);
-    return onlyDeletes
-      ? { risk: 'low', reasons: ['dead-code removal: deletions only, no files removed'], agentWhy: null }
-      : { risk: 'normal', reasons: ['dead-code PR adds lines or deletes whole files'], agentWhy: 'dead-code PR adds lines or deletes whole files' };
+    if (!onlyDeletes) return { risk: 'normal', reasons: ['dead-code PR adds lines or deletes whole files'], agentWhy: 'dead-code PR adds lines or deletes whole files' };
+    if (!sensitive.length) return { risk: 'low', reasons: ['dead-code removal: deletions only, no files removed'], agentWhy: null };
   }
   // A renamed file is low risk only if its old path would be too (src/x.ts → docs/x.md is not docs).
   const results = files.flatMap((f) => (pathsOf(f).length > 1 ? [classifyFile(f), classifyFile({ ...f, filename: f.previous_filename })] : [classifyFile(f)]));
   const blockers = results.filter((r) => !r.low).map((r) => r.why);
-  if (!blockers.length) return { risk: 'low', reasons: [...new Set(results.map((r) => r.why))], agentWhy: null };
+  if (!blockers.length && !sensitive.length) return { risk: 'low', reasons: [...new Set(results.map((r) => r.why))], agentWhy: null };
   const safe = agentSafe({ headRef, files, policy, issue });
   if (safe.ok) return { risk: 'agent', reasons: [safe.why], agentWhy: null };
   // risk:checked: reasons are the rules that put it there, all from the allowlist.
   if (checkedTier(safe, policy)) return { risk: 'checked', reasons: [...new Set(safe.reasons.map((r) => r.why))], agentWhy: safe.why };
-  return { risk: 'normal', reasons: [...blockers, safe.why], agentWhy: safe.why };
+  return { risk: 'normal', reasons: [...new Set([...blockers, ...sensitive, safe.why])], agentWhy: safe.why };
 }
 
 // Structured verdicts bound to a commit:
