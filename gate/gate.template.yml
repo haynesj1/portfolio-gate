@@ -163,11 +163,12 @@ __GATE_JS__
               ]).write();
             }
             if (context.eventName === 'push') {
-              // The agent-safe policy (.ops.yml) changed. Only a push to the default
-              // branch counts; re-evaluate every open agent PR under the new policy.
+              // The policy (.ops.yml) changed. Only a push to the default branch
+              // counts; re-evaluate every open PR under the new policy, whatever its
+              // branch: pivotal_paths and sensitive_paths apply to every PR (issue #26).
               if (context.ref !== `refs/heads/${context.payload.repository?.default_branch}`) return;
               const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
-              for (const p of open.filter((x) => /^(claude|codex)\//.test(x.head.ref))) await evaluate(p.number);
+              for (const p of open) await evaluate(p.number);
               return;
             }
             if (context.eventName === 'issues') {
