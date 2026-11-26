@@ -356,16 +356,29 @@ test('workflow: a non-pass result is published once, with no re-check', async ()
   assert.equal(gets, 1);
 });
 
-test('workflow: a .ops.yml push to the default branch re-evaluates open agent PRs only (Codex P2)', async () => {
+test('workflow: a .ops.yml push to the default branch re-evaluates every open PR, agent or not (Codex P2, #26)', async () => {
   const pr = (number, ref) => ({ number, head: { ref }, body: '' });
   const h = harness({ event: 'push', pushRef: 'refs/heads/main', issueEvent: { repository: { default_branch: 'main' } }, headRef: 'claude/7',
     ops: 'agent_safe: false\n', openPrs: [pr(1, 'claude/7'), pr(2, 'feature/x')], comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
   await h.run();
-  assert.equal(h.written.length, 1);
+  assert.equal(h.written.length, 2);
   assert.equal(h.gate().state, 'pending');
   const other = harness({ event: 'push', pushRef: 'refs/heads/claude/7', issueEvent: { repository: { default_branch: 'main' } }, openPrs: [pr(1, 'claude/7')] });
   await other.run();
   assert.equal(other.written.length, 0);
+});
+
+test('workflow: adding a reviewed docs PR\'s file to pivotal_paths withdraws its risk:low pass on the policy push (#26)', async () => {
+  const docs = [{ filename: 'docs/guide.md', status: 'modified', patch: '+x', additions: 1, deletions: 0 }];
+  const opts = { headRef: 'feature/docs', files: docs, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] };
+  const before = harness(opts);
+  await before.run();
+  assert.equal(before.gate().state, 'success');
+  const h = harness({ ...opts, event: 'push', pushRef: 'refs/heads/main', issueEvent: { repository: { default_branch: 'main' } },
+    ops: 'pivotal_paths:\n  - docs/\n', openPrs: [{ number: 1, head: { ref: 'feature/docs' }, body: '' }] });
+  await h.run();
+  assert.equal(h.gate().state, 'pending');
+  assert.match(h.gate().description, /risk:normal: waiting for human-approved — pivotal path docs\/guide\.md/);
 });
 
 test('caller: pushes of .ops.yml to the default branch trigger the gate', () => {
