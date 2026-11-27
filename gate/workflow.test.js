@@ -621,3 +621,52 @@ test('workflow: deleting the passing check verdict withdraws the pass (#21)', as
   await unruled.run();
   assert.equal(unruled.gate().description, 'risk:checked: waiting for human-approved — reviewer findings answered, not resolved — sensitive path src/auth/login.ts');
 });
+
+// ---- #31: trial, a pivotal_paths file whose issue names an approved spec ----
+const TRIAL_OPS = 'agent_safe: true\npivotal_spec_check: true\npivotal_paths: ["src/pages/**"]\n';
+const pivotalPr = (extra = {}) => harness({ headRef: 'claude/7', ops: TRIAL_OPS, files: [{ filename: 'src/pages/index.astro', status: 'modified', patch: '+x', additions: 1 }],
+  issue: { number: 7, state: 'open', labels: [{ name: 'ready' }], body: 'Builds specs/home.md.' }, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')], ...extra });
+
+test('workflow: with the trial on, a pivotal file whose issue names an approved spec waits for the check, the spec read from the default branch (#31)', async () => {
+  const h = pivotalPr({ contents: { 'main:specs/home.md': '# Home\n\nStatus: approved (27 Nov)\n' } });
+  await h.run();
+  assert.equal(h.gate().description, 'risk:checked: waiting for the check of this commit — pivotal path src/pages/index.astro');
+  assert.deepEqual(h.contentReads, ['main:specs/home.md']);
+  assert.deepEqual(h.added, ['risk:checked']);
+  assert.ok(h.summary.includes('spec named by the linked issue: specs/home.md (approved on the default branch)'), h.summary.join('\n'));
+  const passed = pivotalPr({ contents: { 'main:specs/home.md': 'Status: approved\n' }, comments: [codexComment('H'), verdict('check', 'H', 'pass')] });
+  await passed.run();
+  assert.equal(passed.gate().state, 'success');
+  assert.equal(passed.gate().description, 'risk:checked: check passed and reviewed — pivotal path src/pages/index.astro');
+});
+
+test('workflow: a draft, missing or unnamed spec leaves the pivotal file with the owner (#31)', async () => {
+  const WAITING = 'risk:normal: waiting for human-approved — pivotal path src/pages/index.astro';
+  const draft = pivotalPr({ contents: { 'main:specs/home.md': 'Status: draft\n' }, comments: [codexComment('H'), verdict('check', 'H', 'pass')] });
+  await draft.run();
+  assert.equal(draft.gate().description, WAITING);
+  const missing = pivotalPr({});
+  await missing.run();
+  assert.equal(missing.gate().description, WAITING);
+  // a spec that exists only at the PR's head is never read
+  const onHead = pivotalPr({ contents: { 'H:specs/home.md': 'Status: approved\n' } });
+  await onHead.run();
+  assert.equal(onHead.gate().description, WAITING);
+  assert.deepEqual(onHead.contentReads, ['main:specs/home.md']);
+  const unnamed = pivotalPr({ issue: { number: 7, state: 'open', labels: [{ name: 'ready' }], body: 'No spec.' }, contents: { 'main:specs/home.md': 'Status: approved\n' } });
+  await unnamed.run();
+  assert.equal(unnamed.gate().description, WAITING);
+  assert.deepEqual(unnamed.contentReads, []);
+});
+
+test('workflow: without pivotal_spec_check no spec is read and nothing changes (#31)', async () => {
+  const h = pivotalPr({ ops: 'agent_safe: true\npivotal_paths: ["src/pages/**"]\n', contents: { 'main:specs/home.md': 'Status: approved\n' } });
+  await h.run();
+  assert.equal(h.gate().description, 'risk:normal: waiting for human-approved — pivotal path src/pages/index.astro');
+  assert.deepEqual(h.contentReads, []);
+  // with the key on, a PR that changes no pivotal file reads no spec either
+  const other = pivotalPr({ files: code, contents: { 'main:specs/home.md': 'Status: approved\n' } });
+  await other.run();
+  assert.deepEqual(other.contentReads, []);
+  assert.equal(other.gate().description, 'risk:agent (agent-safe) and reviewed');
+});
