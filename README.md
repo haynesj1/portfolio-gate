@@ -68,6 +68,8 @@ Then the PR is `risk:checked` with the reason `pivotal path <name>`, and the che
 
 What it relies on: agents act with the owner's identity and can edit an issue's body, so an agent can point an issue at any approved spec. The gate proves only that the named spec is approved; whether the change is what that spec describes is the check session's judgement, with the audit of each checked merge behind it (below). **To turn it off:** remove the line or set `pivotal_spec_check: false`; the push of `.ops.yml` re-evaluates every open PR at once.
 
+The evidence is re-read when it changes: the caller also runs the gate when an issue's body is edited and names a spec before or after the edit (the PRs that implement that issue are re-evaluated), and on a default-branch push under `specs/` (every open PR is re-evaluated, as for `.ops.yml`). So a spec set back to draft, or an issue that stops naming it, withdraws a pass that has not merged yet. An issue edit that names no spec is skipped and starts no runner.
+
 **Off switch:** `checked_tier: false` in `.ops.yml` on the default branch turns the tier off for that repository; such PRs are `risk:normal` exactly as before. Absent means on, but only where `agent_safe: true`. Any other value (`no`, `"false"`, …) is unreadable and, like every unreadable line, switches the agent-safe tier off too. `.ops.yml` is read from the default branch only and is a protected path, so a PR cannot turn the tier on for itself.
 
 ### Rulings on answered findings
