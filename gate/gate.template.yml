@@ -7,10 +7,20 @@ name: gate
 
 on:
   workflow_call:
+    inputs:
+      # Where the evaluation runs. A caller passes its repo variable GATE_RUNNER. Only the
+      # exact value `gate-mac` (the owner's self-hosted runner label) is honoured; anything
+      # else, or nothing, runs on GitHub's runner, so a wrong value can never strand the gate
+      # on a runner that does not exist. Either way the job uses this repo's own GITHUB_TOKEN,
+      # so the status still comes from GitHub Actions (portfolio-ops decision 0003).
+      runner:
+        type: string
+        required: false
+        default: ubuntu-24.04
 
 jobs:
   evaluate:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runner == 'gate-mac' && 'gate-mac' || 'ubuntu-24.04' }}
     timeout-minutes: 3
     steps:
       # Never checks out PR code.

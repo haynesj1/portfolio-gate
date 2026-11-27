@@ -7,10 +7,20 @@ name: gate
 
 on:
   workflow_call:
+    inputs:
+      # Where the evaluation runs. A caller passes its repo variable GATE_RUNNER. Only the
+      # exact value `gate-mac` (the owner's self-hosted runner label) is honoured; anything
+      # else, or nothing, runs on GitHub's runner, so a wrong value can never strand the gate
+      # on a runner that does not exist. Either way the job uses this repo's own GITHUB_TOKEN,
+      # so the status still comes from GitHub Actions (portfolio-ops decision 0003).
+      runner:
+        type: string
+        required: false
+        default: ubuntu-24.04
 
 jobs:
   evaluate:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runner == 'gate-mac' && 'gate-mac' || 'ubuntu-24.04' }}
     timeout-minutes: 3
     steps:
       # Never checks out PR code.
@@ -755,7 +765,7 @@ jobs:
 
               return module.exports; })();
             // Approved copies (issue #19): embedded from gate/approved-copies.json at build time.
-            const APPROVED_COPIES = {"files":[{"path":".github/workflows/pr-gate.yml","sha256":["409e192d97e416ab7269c5fdb35d934f9d2c9ba63e7cae3c5d3e6eca4e2a2b86"]}],"blocks":[{"path":"AGENTS.md","start":"<!-- portfolio-ops:common:start -->","end":"<!-- portfolio-ops:common:end -->","sha256":["44c98b1b8251c9ae802aeafdc5b731e5f8a046e09bc5709f2f4e085cb28b3846"]}]};
+            const APPROVED_COPIES = {"files":[{"path":".github/workflows/pr-gate.yml","sha256":["4b1ca4292319a9c9bb1123112e7497708cb142bf1acb1d6360e38cecb782fd49"]}],"blocks":[{"path":"AGENTS.md","start":"<!-- portfolio-ops:common:start -->","end":"<!-- portfolio-ops:common:end -->","sha256":["44c98b1b8251c9ae802aeafdc5b731e5f8a046e09bc5709f2f4e085cb28b3846"]}]};
             const copyReads = new Map(); // `${sha}:${path}` -> decoded text or null, for this run
             const { owner, repo } = context.repo;
             // Reads every input the gate decides on, fresh from GitHub.
