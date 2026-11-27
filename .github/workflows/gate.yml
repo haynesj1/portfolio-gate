@@ -895,6 +895,12 @@ jobs:
                 if (!fresh || fresh.headSha !== headSha) break; // closed, or a new commit with its own evaluation
                 const again = gate.decide(fresh);
                 if (again.state === result.state && again.risk === result.risk) break;
+                // Auto-merge can merge the PR while the inputs are being re-read. GitHub then stops
+                // tying the earlier gate runs to it, so the re-read finds no adoption time and a good
+                // approval looks stale. Read the PR once more: one that is no longer open (or has a
+                // new head) keeps the status it merged on (issue #30). An open PR is judged as before.
+                const { data: current } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+                if (current.state !== 'open' || current.head.sha !== headSha) break;
                 input = fresh;
                 result = again;
                 await publish(result, fresh.labels);
