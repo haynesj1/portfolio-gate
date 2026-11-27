@@ -373,6 +373,29 @@ test('workflow: after publishing a pass, a review:blocking label added meanwhile
   assert.deepEqual(h.written.filter((x) => x.context === 'review-gate').map((x) => x.state), ['success', 'failure']);
 });
 
+test('workflow: a PR that merges while the pass is re-checked keeps its pass (#30)', async () => {
+  // Approved and reviewed: the pass is published, auto-merge merges the PR, and the re-read then finds no
+  // gate run tied to the PR (GitHub drops the link on merge), so the approval would look stale.
+  const h = harness({ labels: ['human-approved'], comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')], timeline: [labelled('2026-11-06T10:00:00Z')] });
+  let runReads = 0; const listRuns = h.github.rest.actions.listWorkflowRunsForRepo;
+  h.github.rest.actions.listWorkflowRunsForRepo = async (a) => (runReads++ === 0 ? listRuns(a) : []);
+  const get = h.github.rest.pulls.get; let gets = 0;
+  // Reads 1 and 2 (the first gather and the re-read) see it open; the read before a changed result sees it merged.
+  h.github.rest.pulls.get = async (a) => { const r = await get(a); return gets++ < 2 ? r : { data: { ...r.data, state: 'closed', merged: true } }; };
+  await h.run();
+  assert.deepEqual(h.written.filter((x) => x.context === 'review-gate').map((x) => x.state), ['success']);
+});
+
+test('workflow: a PR still open when the re-check changes the result gets the new result (#30)', async () => {
+  // The same lost adoption time on a PR that is still open: the pass is withdrawn, as before.
+  const h = harness({ labels: ['human-approved'], comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')], timeline: [labelled('2026-11-06T10:00:00Z')] });
+  let runReads = 0; const listRuns = h.github.rest.actions.listWorkflowRunsForRepo;
+  h.github.rest.actions.listWorkflowRunsForRepo = async (a) => (runReads++ === 0 ? listRuns(a) : []);
+  await h.run();
+  assert.deepEqual(h.written.filter((x) => x.context === 'review-gate').map((x) => x.state), ['success', 'pending']);
+  assert.match(h.gate().description, /approval predates this commit/);
+});
+
 test('workflow: a non-pass result is published once, with no re-check', async () => {
   const h = harness({ comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')] });
   let gets = 0; const get = h.github.rest.pulls.get;
