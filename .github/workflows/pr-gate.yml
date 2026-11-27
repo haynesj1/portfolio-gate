@@ -17,13 +17,17 @@ on:
     types: [created, edited, deleted]
   # The agent-safe tier depends on the linked issue (open, queued, not pivotal),
   # so changes to it re-evaluate the PRs that implement it.
+  # edited: under the pivotal_spec_check trial the issue's body names the spec, so a body
+  # edit can withdraw a pass (portfolio-gate#31).
   issues:
-    types: [closed, reopened, labeled, unlabeled]
+    types: [closed, reopened, labeled, unlabeled, edited]
   # A change to .ops.yml on the default branch (the agent-safe policy) re-evaluates
-  # every open agent PR, so tightening the policy withdraws earlier passes.
+  # every open PR, so tightening the policy withdraws earlier passes. So does a change
+  # under specs/ there: the pivotal_spec_check trial reads a spec's status from the
+  # default branch, and a spec that stops being approved must withdraw a pass.
   push:
     branches: [main, master]
-    paths: ['.ops.yml']
+    paths: ['.ops.yml', 'specs/**']
 
 permissions:
   actions: read
@@ -54,7 +58,10 @@ jobs:
     # (a deleted event's payload still holds the comment body), so withdrawn
     # evidence is recomputed at once.
     # Issue events evaluate only when they can change the agent-safe tier: the
-    # issue closed or reopened, or its ready / in-progress / pivotal label changed.
+    # issue closed or reopened, or its ready / in-progress / pivotal label changed,
+    # or its body was edited and names a spec before or after the edit (the
+    # pivotal_spec_check trial reads the spec the body names). Title-only edits and
+    # edits of issues that name no spec are skipped.
     # Tested in gate/workflow.test.js ("caller comment filter" and "caller PR filter").
     if: >-
       (github.event_name != 'issue_comment' && github.event_name != 'issues' &&
@@ -73,7 +80,9 @@ jobs:
       (github.event_name == 'issues' && !github.event.issue.pull_request &&
        (github.event.action == 'closed' || github.event.action == 'reopened' ||
         github.event.label.name == 'ready' || github.event.label.name == 'in-progress' ||
-        github.event.label.name == 'pivotal')) ||
+        github.event.label.name == 'pivotal' ||
+        (github.event.action == 'edited' && github.event.changes.body &&
+         (contains(github.event.issue.body, 'specs/') || contains(github.event.changes.body.from, 'specs/'))))) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
        (contains(github.event.comment.body, 'review-verdict:v1') ||
         contains(github.event.comment.body, 'codex-review-state:v1') ||

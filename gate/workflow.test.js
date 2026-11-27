@@ -151,10 +151,11 @@ test('caller only uses triggers that run default-branch code, and calls the gate
   const caller = fs.readFileSync(path.join(__dirname, '..', 'caller', 'pr-gate.yml'), 'utf8');
   const on = caller.slice(caller.indexOf('\non:'), caller.indexOf('\npermissions:'));
   for (const bad of ['pull_request_review', 'workflow_dispatch', '\n  pull_request:', 'workflow_run']) assert.ok(!on.includes(bad), bad);
-  // push is allowed only as default-branch pushes of .ops.yml (policy changes), which
-  // happen only by merging a reviewed PR; any other push trigger is rejected.
+  // push is allowed only as default-branch pushes of .ops.yml (policy changes) and of specs/**
+  // (a spec's approval, read by the pivotal_spec_check trial), which happen only by merging a
+  // reviewed PR; any other push trigger is rejected.
   const pushBlock = on.includes('push:') ? on.slice(on.indexOf('\n  push:')).split('\n').filter((l) => /^ {4}\S/.test(l)) : [];
-  if (on.includes('push:')) assert.deepEqual(pushBlock, ["    branches: [main, master]", "    paths: ['.ops.yml']"]);
+  if (on.includes('push:')) assert.deepEqual(pushBlock, ["    branches: [main, master]", "    paths: ['.ops.yml', 'specs/**']"]);
   assert.ok(on.includes('pull_request_target') && on.includes('issue_comment'));
   assert.match(caller, /uses: haynesj1\/portfolio-gate\/\.github\/workflows\/gate\.yml@main/);
   // Comment runs are filtered to review results, and concurrency sits on the job so a
@@ -407,9 +408,9 @@ test('workflow: adding a reviewed docs PR\'s file to pivotal_paths withdraws its
   assert.match(h.gate().description, /risk:normal: waiting for human-approved — pivotal path docs\/guide\.md/);
 });
 
-test('caller: pushes of .ops.yml to the default branch trigger the gate', () => {
+test('caller: pushes of .ops.yml or a spec to the default branch trigger the gate', () => {
   const callerYml = fs.readFileSync(path.join(__dirname, '..', 'caller', 'pr-gate.yml'), 'utf8');
-  assert.match(callerYml, /push:\n\s+branches: \[main, master\]\n\s+paths: \['\.ops\.yml'\]/);
+  assert.match(callerYml, /push:\n\s+branches: \[main, master\]\n\s+paths: \['\.ops\.yml', 'specs\/\*\*'\]/);
 });
 
 test('workflow: answered Codex findings pass their thread fields through; the PR waits for human-approved (#14)', async () => {
@@ -620,4 +621,97 @@ test('workflow: deleting the passing check verdict withdraws the pass (#21)', as
   const unruled = checkedPr({ event: 'issue_comment', action: 'deleted', comments: [codexComment('H', true), verdict('check', 'H', 'pass')], reviewComments });
   await unruled.run();
   assert.equal(unruled.gate().description, 'risk:checked: waiting for human-approved — reviewer findings answered, not resolved — sensitive path src/auth/login.ts');
+});
+
+// ---- #31: trial, a pivotal_paths file whose issue names an approved spec ----
+const TRIAL_OPS = 'agent_safe: true\npivotal_spec_check: true\npivotal_paths: ["src/pages/**"]\n';
+const pivotalPr = (extra = {}) => harness({ headRef: 'claude/7', ops: TRIAL_OPS, files: [{ filename: 'src/pages/index.astro', status: 'modified', patch: '+x', additions: 1 }],
+  issue: { number: 7, state: 'open', labels: [{ name: 'ready' }], body: 'Builds specs/home.md.' }, comments: [codexComment('H')], runs: [run('H', '2026-11-06T09:00:00Z')], ...extra });
+
+test('workflow: with the trial on, a pivotal file whose issue names an approved spec waits for the check, the spec read from the default branch (#31)', async () => {
+  const h = pivotalPr({ contents: { 'main:specs/home.md': '# Home\n\nStatus: approved (27 Nov)\n' } });
+  await h.run();
+  assert.equal(h.gate().description, 'risk:checked: waiting for the check of this commit — pivotal path src/pages/index.astro');
+  assert.deepEqual(h.contentReads, ['main:specs/home.md']);
+  assert.deepEqual(h.added, ['risk:checked']);
+  assert.ok(h.summary.includes('spec named by the linked issue: specs/home.md (approved on the default branch)'), h.summary.join('\n'));
+  const passed = pivotalPr({ contents: { 'main:specs/home.md': 'Status: approved\n' }, comments: [codexComment('H'), verdict('check', 'H', 'pass')] });
+  await passed.run();
+  assert.equal(passed.gate().state, 'success');
+  assert.equal(passed.gate().description, 'risk:checked: check passed and reviewed — pivotal path src/pages/index.astro');
+});
+
+test('workflow: a draft, missing or unnamed spec leaves the pivotal file with the owner (#31)', async () => {
+  const WAITING = 'risk:normal: waiting for human-approved — pivotal path src/pages/index.astro';
+  const draft = pivotalPr({ contents: { 'main:specs/home.md': 'Status: draft\n' }, comments: [codexComment('H'), verdict('check', 'H', 'pass')] });
+  await draft.run();
+  assert.equal(draft.gate().description, WAITING);
+  const missing = pivotalPr({});
+  await missing.run();
+  assert.equal(missing.gate().description, WAITING);
+  // a spec that exists only at the PR's head is never read
+  const onHead = pivotalPr({ contents: { 'H:specs/home.md': 'Status: approved\n' } });
+  await onHead.run();
+  assert.equal(onHead.gate().description, WAITING);
+  assert.deepEqual(onHead.contentReads, ['main:specs/home.md']);
+  const unnamed = pivotalPr({ issue: { number: 7, state: 'open', labels: [{ name: 'ready' }], body: 'No spec.' }, contents: { 'main:specs/home.md': 'Status: approved\n' } });
+  await unnamed.run();
+  assert.equal(unnamed.gate().description, WAITING);
+  assert.deepEqual(unnamed.contentReads, []);
+});
+
+test('workflow: without pivotal_spec_check no spec is read and nothing changes (#31)', async () => {
+  const h = pivotalPr({ ops: 'agent_safe: true\npivotal_paths: ["src/pages/**"]\n', contents: { 'main:specs/home.md': 'Status: approved\n' } });
+  await h.run();
+  assert.equal(h.gate().description, 'risk:normal: waiting for human-approved — pivotal path src/pages/index.astro');
+  assert.deepEqual(h.contentReads, []);
+  // with the key on, a PR that changes no pivotal file reads no spec either
+  const other = pivotalPr({ files: code, contents: { 'main:specs/home.md': 'Status: approved\n' } });
+  await other.run();
+  assert.deepEqual(other.contentReads, []);
+  assert.equal(other.gate().description, 'risk:agent (agent-safe) and reviewed');
+});
+
+test('caller issue filter: a body edit evaluates only when the issue names a spec before or after it (#31)', () => {
+  const callerYml = fs.readFileSync(path.join(__dirname, '..', 'caller', 'pr-gate.yml'), 'utf8');
+  assert.match(callerYml, /issues:\n\s+types: \[closed, reopened, labeled, unlabeled, edited\]/);
+  const lines = callerYml.split('\n');
+  const start = lines.findIndex((l) => /^\s+if: >-$/.test(l));
+  const expr = lines.slice(start + 1).filter((l, i, a) => a.slice(0, i + 1).every((x) => /^\s{6}/.test(x))).join(' ');
+  const contains = (hay, needle) => String(hay ?? '').toLowerCase().includes(String(needle).toLowerCase());
+  const js = expr.replace(/github(\.\w+)+/g, (m) => m.replace(/\./g, '?.'));
+  const run = (github) => Boolean(new Function('github', 'contains', `return (${js});`)(github, contains));
+  const issue = (action, extra = {}) => run({ event_name: 'issues', event: { action, issue: { body: '' }, ...extra } });
+  const edited = (body, from, more = {}) => issue('edited', { issue: { body, ...more }, changes: from === undefined ? { title: { from: 'Old' } } : { body: { from } } });
+  // the spec link was added, removed, changed or kept
+  assert.equal(edited('Builds specs/home.md.', 'No spec.'), true);
+  assert.equal(edited('No spec.', 'Builds specs/home.md.'), true);
+  assert.equal(edited('Builds specs/other.md.', 'Builds specs/home.md.'), true);
+  assert.equal(edited('Builds specs/home.md. More text.', 'Builds specs/home.md.'), true);
+  // no spec named on either side, or the body did not change: skipped (no runner starts)
+  assert.equal(edited('Reworded.', 'Worded.'), false);
+  assert.equal(edited('Builds specs/home.md.', undefined), false);
+  assert.equal(edited('Builds specs/home.md.', ''), true);
+  // a pull request is an issue to this event: never evaluated from here
+  assert.equal(edited('Builds specs/home.md.', 'x', { pull_request: { url: 'x' } }), false);
+  // the earlier issue rules are unchanged
+  assert.equal(issue('closed'), true);
+  assert.equal(issue('reopened'), true);
+  for (const l of ['ready', 'in-progress', 'pivotal']) assert.equal(issue('labeled', { label: { name: l } }), true, l);
+  assert.equal(issue('labeled', { label: { name: 'size:S' } }), false);
+});
+
+test('workflow: a spec that stops being approved withdraws the pivotal pass on the push of the spec (#31)', async () => {
+  // The check passed while the spec was approved; the spec is then set back to draft on the default branch.
+  const args = { event: 'push', pushRef: 'refs/heads/main', issueEvent: { repository: { default_branch: 'main' } }, openPrs: [{ number: 1, head: { ref: 'claude/7' }, body: '' }],
+    comments: [codexComment('H'), verdict('check', 'H', 'pass')], contents: { 'main:specs/home.md': 'Status: draft\n' } };
+  const h = pivotalPr(args);
+  await h.run();
+  assert.equal(h.gate().state, 'pending');
+  assert.equal(h.gate().description, 'risk:normal: waiting for human-approved — pivotal path src/pages/index.astro');
+  // and an issue whose body no longer names the spec does the same on the issue event
+  const edited = pivotalPr({ event: 'issues', issueEvent: { action: 'edited', issue: { number: 7 } }, openPrs: [{ number: 1, head: { ref: 'claude/7' }, body: '' }],
+    issue: { number: 7, state: 'open', labels: [{ name: 'ready' }], body: 'No spec any more.' }, comments: [codexComment('H'), verdict('check', 'H', 'pass')], contents: { 'main:specs/home.md': 'Status: approved\n' } });
+  await edited.run();
+  assert.equal(edited.gate().description, 'risk:normal: waiting for human-approved — pivotal path src/pages/index.astro');
 });

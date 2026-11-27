@@ -90,8 +90,10 @@ function parseOpsPolicy(text) {
   // so syntax this parser doesn't understand can never drop a restriction.
   // checkedTier (issue #21): on unless `checked_tier: false`; it only ever
   // applies where agentSafe is also true. Once false it stays false.
-  const policy = { agentSafe: false, maxLines: 400, sensitive: [], pivotal: [], checkedTier: true };
-  const off = (why) => ({ ...policy, agentSafe: false, checkedTier: false, invalid: why });
+  // pivotalSpecCheck (issue #31, a trial): off unless `pivotal_spec_check: true`; it only ever applies where
+  // agentSafe and checkedTier are also true.
+  const policy = { agentSafe: false, maxLines: 400, sensitive: [], pivotal: [], checkedTier: true, pivotalSpecCheck: false };
+  const off = (why) => ({ ...policy, agentSafe: false, checkedTier: false, pivotalSpecCheck: false, invalid: why });
   let list = null;
   for (const raw of String(text || '').split('\n')) {
     if (/^\s*(#.*)?$/.test(raw)) continue;
@@ -106,6 +108,9 @@ function parseOpsPolicy(text) {
     else if (key === 'checked_tier') {
       if (value !== 'true' && value !== 'false') return off('checked_tier is not true or false');
       policy.checkedTier = policy.checkedTier && value === 'true';
+    } else if (key === 'pivotal_spec_check') {
+      if (value !== 'true' && value !== 'false') return off('pivotal_spec_check is not true or false');
+      policy.pivotalSpecCheck = value === 'true';
     } else if (key === 'agent_max_lines') { if (!/^\d+$/.test(value)) return off('agent_max_lines is not a number'); policy.maxLines = Number(value); }
     else if (key === 'sensitive_paths' || key === 'pivotal_paths') {
       const name = key === 'sensitive_paths' ? 'sensitive' : 'pivotal';
@@ -134,6 +139,24 @@ function globToRegExp(glob) {
 }
 const matchesAny = (file, globs) => globs.some((g) => globToRegExp(g).test(file));
 const pathsOf = (f) => (f.previous_filename && f.previous_filename !== f.filename ? [f.filename, f.previous_filename] : [f.filename]);
+
+// Trial (issue #31; portfolio-ops decision 0017). The spec an issue names is the first `specs/<name>.md` path in
+// its body; a path with an empty, `.` or `..` segment names nothing. A spec is approved when the first "Status:" in
+// the file is followed by the word "approved" ("Status: approved", "**Status:** approved"): the same rule the
+// portfolio-ops dispatcher uses. The workflow reads the file from the default branch, never from the PR.
+const SPEC_LINK = /\bspecs\/[\w./-]+\.md\b/;
+function specPathOf(body) {
+  const m = SPEC_LINK.exec(String(body || ''));
+  if (!m || m[0].split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) return null;
+  return m[0];
+}
+const specApproved = (text) => { const m = /\bstatus\b[\s*_]*:[\s*_]*([a-z]+)/i.exec(String(text || '')); return !!m && m[1].toLowerCase() === 'approved'; };
+// Does the trial let the check stand in for the owner on a pivotal_paths file? Only where the repo opted in to all
+// three tiers and the linked issue names a spec the workflow found approved on the default branch (issue.spec).
+const pivotalByCheck = (policy, issue) => policy?.agentSafe === true && policy.checkedTier === true
+  && policy.pivotalSpecCheck === true && issue?.spec?.approved === true;
+// Does the PR change a pivotal_paths file (either path of a rename)? The workflow reads the spec only then.
+const touchesPivotal = (files, policy) => (files || []).flatMap(pathsOf).some((n) => matchesAny(n, policy?.pivotal || []));
 
 // The issue an agent PR implements: from a `claude/<n>` or `codex/<n>` branch,
 // else the first `Closes #n` in the body.
@@ -234,9 +257,11 @@ function agentSafe({ headRef, files, policy, issue }) {
 // deleted file, a removed or skipped test. Any other code, including one added
 // to agentSafe later, keeps the PR at risk:normal.
 const CHECKABLE_REASONS = new Set(['size', 'sensitive', 'deleted', 'tests']);
-function checkedTier(safe, policy) {
+// `pivotal` is accepted only under the trial of issue #31 (pivotalByCheck): never by default.
+function checkedTier(safe, policy, issue) {
+  const accepted = (code) => CHECKABLE_REASONS.has(code) || (code === 'pivotal' && pivotalByCheck(policy, issue));
   return policy?.agentSafe === true && policy.checkedTier === true && !safe.ok
-    && Array.isArray(safe.reasons) && safe.reasons.length > 0 && safe.reasons.every((r) => CHECKABLE_REASONS.has(r.code));
+    && Array.isArray(safe.reasons) && safe.reasons.length > 0 && safe.reasons.every((r) => accepted(r.code));
 }
 
 function isPatchBump(title) {
@@ -387,22 +412,26 @@ function classify({ author, title, labels, files, commitAuthors = [], headRef, p
   // is never risk:low and falls to risk:checked or risk:normal below.
   const names = files.flatMap(pathsOf);
   const pivotal = names.filter((n) => matchesAny(n, policy?.pivotal || [])).map((n) => `pivotal path ${n}`);
-  if (pivotal.length) return { risk: 'normal', reasons: pivotal, agentWhy: pivotal[0] };
+  // Trial (issue #31): where the repo set pivotal_spec_check and the linked issue names an approved spec, a pivotal
+  // file does not settle the tier here. It is still never risk:low or risk:agent: it falls to agentSafe below, which
+  // lists it as a reason, and only the checked tier may accept that reason. Everywhere else, as before.
+  const pivotalToCheck = pivotal.length > 0 && pivotalByCheck(policy, issue);
+  if (pivotal.length && !pivotalToCheck) return { risk: 'normal', reasons: pivotal, agentWhy: pivotal[0] };
   const sensitive = names.filter((n) => matchesAny(n, policy?.sensitive || [])).map((n) => `sensitive path ${n}`);
   if (labels.includes('type:dead-code')) {
     const onlyDeletes = files.every((f) => f.status !== 'removed' && f.additions === 0);
     if (!onlyDeletes) return { risk: 'normal', reasons: ['dead-code PR adds lines or deletes whole files'], agentWhy: 'dead-code PR adds lines or deletes whole files' };
-    if (!sensitive.length) return { risk: 'low', reasons: ['dead-code removal: deletions only, no files removed'], agentWhy: null };
+    if (!sensitive.length && !pivotal.length) return { risk: 'low', reasons: ['dead-code removal: deletions only, no files removed'], agentWhy: null };
   }
   // A renamed file is low risk only if its old path would be too (src/x.ts → docs/x.md is not docs).
   const results = files.flatMap((f) => (pathsOf(f).length > 1 ? [classifyFile(f), classifyFile({ ...f, filename: f.previous_filename })] : [classifyFile(f)]));
   const blockers = results.filter((r) => !r.low).map((r) => r.why);
-  if (!blockers.length && !sensitive.length) return { risk: 'low', reasons: [...new Set(results.map((r) => r.why))], agentWhy: null };
+  if (!blockers.length && !sensitive.length && !pivotal.length) return { risk: 'low', reasons: [...new Set(results.map((r) => r.why))], agentWhy: null };
   const safe = agentSafe({ headRef, files, policy, issue });
   if (safe.ok) return { risk: 'agent', reasons: [safe.why], agentWhy: null };
   // risk:checked: reasons are the rules that put it there, all from the allowlist.
-  if (checkedTier(safe, policy)) return { risk: 'checked', reasons: [...new Set(safe.reasons.map((r) => r.why))], agentWhy: safe.why };
-  return { risk: 'normal', reasons: [...new Set([...blockers, ...sensitive, safe.why])], agentWhy: safe.why };
+  if (checkedTier(safe, policy, issue)) return { risk: 'checked', reasons: [...new Set(safe.reasons.map((r) => r.why))], agentWhy: safe.why };
+  return { risk: 'normal', reasons: [...new Set([...blockers, ...pivotal, ...sensitive, safe.why])], agentWhy: safe.why };
 }
 
 // Structured verdicts bound to a commit:
@@ -731,4 +760,4 @@ function decide(input) {
   return { risk, reasons, agentWhy, review, secondReview: second, overridden, approved, check, ruling: ruling?.result ?? null, settled, state, description };
 }
 
-module.exports = { checkVerdict, rulingVerdict, rulingCovers, markerLine, VERDICT_MARKERS, CHECKABLE_REASONS, approvedListError, approvedCopyPlan, approvedCopy, decodeContent, copyHash, ACTIONS_BOT, codexFindingsAnswered, secondReview, pathsOf, countTestLines, countPrTestLines, REMOVED_TEST_LINE, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };
+module.exports = { specPathOf, specApproved, pivotalByCheck, touchesPivotal, checkVerdict, rulingVerdict, rulingCovers, markerLine, VERDICT_MARKERS, CHECKABLE_REASONS, approvedListError, approvedCopyPlan, approvedCopy, decodeContent, copyHash, ACTIONS_BOT, codexFindingsAnswered, secondReview, pathsOf, countTestLines, countPrTestLines, REMOVED_TEST_LINE, parseOpsPolicy, globToRegExp, linkedIssue, agentSafe, classify, classifyFile, isPatchBump, verdictFor, reviewState, humanApproved, reviewOverridden, decide };

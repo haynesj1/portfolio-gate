@@ -147,7 +147,7 @@ const policyOff = g.parseOpsPolicy(`${OPS}checked_tier: false\n`);
 const offRisk = (over) => g.classify({ ...agentPr, policy: policyOff, ...over }).risk;
 
 test('agent-safe: .ops.yml policy is parsed, off by default', () => {
-  assert.deepEqual(policy, { agentSafe: true, maxLines: 300, sensitive: ['src/auth/**', 'db/migrations/'], pivotal: ['src/routes/reveal/**'], checkedTier: true });
+  assert.deepEqual(policy, { agentSafe: true, maxLines: 300, sensitive: ['src/auth/**', 'db/migrations/'], pivotal: ['src/routes/reveal/**'], checkedTier: true, pivotalSpecCheck: false });
   assert.equal(g.parseOpsPolicy('app: x\n').agentSafe, false);
   assert.equal(g.parseOpsPolicy('').maxLines, 400);
 });
@@ -1437,4 +1437,95 @@ test('#26: approved copies and Dependabot patch bumps are unchanged by the lists
   // Dependabot patch bumps are decided before the lists are read.
   const dep = { ...base, author: 'dependabot[bot]', title: 'Bump a from 1.2.3 to 1.2.4', commitAuthors: ['dependabot[bot]'], files: [f('package.json')] };
   assert.equal(g.classify({ ...dep, policy: g.parseOpsPolicy('pivotal_paths: ["package.json"]\n') }).risk, 'low');
+});
+
+// ---- #31: trial, a pivotal_paths file whose issue names an approved spec goes to the check ----
+const TRIAL = g.parseOpsPolicy(`agent_safe: true\npivotal_spec_check: true\n${LISTS}`);
+const withSpec = (approved, path = 'specs/reveal.md') => ({ ...queued, spec: { path, approved } });
+const pivotalFile = f('src/routes/reveal/page.svelte');
+
+test('#31: pivotal_spec_check is off unless true, and an unreadable value switches the tiers off', () => {
+  assert.equal(g.parseOpsPolicy('agent_safe: true\n').pivotalSpecCheck, false);
+  assert.equal(g.parseOpsPolicy('agent_safe: true\npivotal_spec_check: false\n').pivotalSpecCheck, false);
+  assert.equal(TRIAL.pivotalSpecCheck, true);
+  for (const v of ['yes', '"true"', 'True', '1', '']) {
+    const p = g.parseOpsPolicy(`agent_safe: true\npivotal_spec_check: ${v}\n`);
+    assert.deepEqual([p.agentSafe, p.checkedTier, p.pivotalSpecCheck], [false, false, false], v);
+    assert.ok(p.invalid, v);
+  }
+});
+
+test('#31: the spec an issue names, and when it counts as approved', () => {
+  assert.equal(g.specPathOf('Spec: specs/reveal.md (approved)'), 'specs/reveal.md');
+  assert.equal(g.specPathOf('See https://github.com/o/r/blob/main/specs/a/b-1.md and specs/second.md'), 'specs/a/b-1.md');
+  for (const body of ['', null, 'no spec here', 'specs/../AGENTS.md', 'specs/./x.md', 'specs//x.md', 'specs/x.txt']) assert.equal(g.specPathOf(body), null, String(body));
+  for (const text of ['Status: approved', '**Status:** approved (Jordan, 27 Nov)', '# T\n\n- **Status:** Approved\n']) assert.equal(g.specApproved(text), true, text);
+  for (const text of ['', null, 'Status: draft', 'Status: not approved', 'Status: draft\nWhen accepted, set Status: approved']) assert.equal(g.specApproved(text), false, String(text));
+});
+
+test('#31: with the trial on and an approved spec, a pivotal file puts the PR in risk:checked, never low or agent', () => {
+  const r = g.classify({ ...agentPr, policy: TRIAL, issue: withSpec(true), files: [pivotalFile] });
+  assert.deepEqual(r, { risk: 'checked', reasons: ['pivotal path src/routes/reveal/page.svelte'], agentWhy: 'pivotal path src/routes/reveal/page.svelte' });
+  // Markdown and an added test under a pivotal path would be risk:low anywhere else: here they are checked.
+  assert.equal(g.classify({ ...agentPr, policy: TRIAL, issue: withSpec(true), files: [f('docs/journey/welcome.md')] }).risk, 'checked');
+  assert.equal(g.classify({ ...agentPr, policy: TRIAL, issue: withSpec(true), files: [addedTest('src/routes/reveal/page.test.ts')] }).risk, 'checked');
+  // a dead-code PR on a pivotal file is not risk:low either
+  const dead = { ...agentPr, policy: TRIAL, issue: withSpec(true), labels: ['type:dead-code'], files: [f('src/routes/reveal/page.svelte', '-x', { additions: 0, deletions: 1 })] };
+  assert.equal(g.classify(dead).risk, 'checked');
+  // together with the other checkable reasons
+  assert.equal(g.classify({ ...agentPr, policy: TRIAL, issue: withSpec(true), files: [pivotalFile, f('src/auth/login.ts'), big] }).risk, 'checked');
+});
+
+test('#31: the check decides such a PR; the owner can still approve it', () => {
+  const input = { ...agentPr, policy: TRIAL, issue: withSpec(true), files: [pivotalFile] };
+  const WHY = 'pivotal path src/routes/reveal/page.svelte';
+  assert.equal(g.decide({ ...input, feedback: [codex('H')] }).description, `risk:checked: waiting for the check of this commit — ${WHY}`);
+  const pass = g.decide({ ...input, feedback: [codex('H'), checkV('H', 'pass')] });
+  assert.deepEqual([pass.state, pass.description], ['success', `risk:checked: check passed and reviewed — ${WHY}`]);
+  const unclear = g.decide({ ...input, feedback: [codex('H'), checkV('H', 'unclear')] });
+  assert.deepEqual([unclear.state, unclear.description], ['pending', `risk:checked: check unclear; waiting for human-approved — ${WHY}`]);
+  // no review yet: nothing passes
+  assert.equal(g.decide({ ...input, feedback: [checkV('H', 'pass')] }).state, 'pending');
+});
+
+test('#31: without the key, without an approved spec, or with any other rule failing, the PR is risk:normal as before', () => {
+  const normal = (extra, why = 'pivotal path src/routes/reveal/page.svelte') => {
+    const r = g.classify({ ...agentPr, policy: TRIAL, issue: withSpec(true), files: [pivotalFile], ...extra });
+    assert.equal(r.risk, 'normal', JSON.stringify(extra));
+    assert.equal(r.agentWhy, why, JSON.stringify(extra));
+    assert.ok(r.reasons.includes('pivotal path src/routes/reveal/page.svelte'), JSON.stringify(extra));
+  };
+  normal({ policy: listsAgent }); // key absent
+  normal({ policy: g.parseOpsPolicy(`agent_safe: true\npivotal_spec_check: false\n${LISTS}`) });
+  normal({ policy: g.parseOpsPolicy(`agent_safe: true\npivotal_spec_check: true\nchecked_tier: false\n${LISTS}`) });
+  normal({ policy: g.parseOpsPolicy(`pivotal_spec_check: true\n${LISTS}`) }); // agent_safe off
+  normal({ issue: queued }); // the workflow read no spec
+  normal({ issue: withSpec(false) }); // named, not approved
+  normal({ issue: { ...queued, spec: { path: null, approved: false } } }); // none named
+  normal({ issue: { ...queued, spec: { path: 'specs/reveal.md', approved: 'true' } } }); // only the boolean true counts
+  normal({ issue: null });
+  // The branch and issue rules come first and are not reasons the check accepts.
+  normal({ headRef: 'feature/x' }, 'not an agent branch');
+  normal({ issue: { ...withSpec(true), labels: ['ready', 'pivotal'] } }, 'linked issue is pivotal');
+  normal({ issue: { ...withSpec(true), labels: ['agent:claude'] } }, 'linked issue was not queued (ready)');
+  normal({ issue: { ...withSpec(true), state: 'closed' } }, 'linked issue is not open');
+  // A dependency file is not checkable, so the whole PR stays with the owner.
+  normal({ files: [pivotalFile, f('package.json')] }, 'pivotal path src/routes/reveal/page.svelte');
+  // A protected path is decided before any of this.
+  assert.deepEqual(g.classify({ ...agentPr, policy: TRIAL, issue: withSpec(true), files: [pivotalFile, f('specs/reveal.md')] }).reasons, ['protected path specs/reveal.md']);
+  // Not an agent PR at all (a person's branch): the pivotal file still needs the owner.
+  assert.equal(g.decide({ ...base, policy: TRIAL, issue: null, files: [pivotalFile], feedback: [codex('H'), checkV('H', 'pass')] }).description, `${WAIT} — pivotal path src/routes/reveal/page.svelte`);
+});
+
+test('#31: the reason is accepted by the checked tier only under the trial', () => {
+  const safe = { ok: false, reasons: [{ code: 'pivotal', why: 'pivotal path x' }] };
+  assert.equal(g.pivotalByCheck(TRIAL, withSpec(true)), true);
+  assert.equal(g.pivotalByCheck(listsAgent, withSpec(true)), false);
+  assert.equal(g.pivotalByCheck(TRIAL, withSpec(false)), false);
+  assert.equal(g.pivotalByCheck(TRIAL, null), false);
+  assert.ok(!g.CHECKABLE_REASONS.has('pivotal'));
+  assert.equal(g.touchesPivotal([f('src/a.ts'), f('src/b.ts', '+x', { status: 'renamed', previous_filename: 'src/routes/reveal/b.ts' })], TRIAL), true);
+  assert.equal(g.touchesPivotal([f('src/a.ts')], TRIAL), false);
+  assert.equal(g.touchesPivotal([f('src/a.ts')], null), false);
+  void safe;
 });

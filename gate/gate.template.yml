@@ -74,10 +74,24 @@ __GATE_JS__
                 if (!policy?.agentSafe || !n) return null;
                 try {
                   const { data } = await github.rest.issues.get({ owner, repo, issue_number: n });
-                  return data.pull_request ? null : { number: n, state: data.state, labels: data.labels.map((l) => (typeof l === 'string' ? l : l.name)) };
+                  return data.pull_request ? null : { number: n, state: data.state, labels: data.labels.map((l) => (typeof l === 'string' ? l : l.name)), body: data.body || '' };
                 } catch (e) { core.info(`linked issue #${n} not readable: ${e.status || e.message}`); return null; }
               };
               const issue = await readIssue(issueNumber);
+              // Trial (issue #31): only where .ops.yml on the default branch says pivotal_spec_check: true, and only
+              // when the PR changes a pivotal_paths file, read the spec the linked issue names. Always from the
+              // default branch, never from the PR. Missing, unreadable or not approved: not approved.
+              if (issue && policy?.pivotalSpecCheck === true && gate.touchesPivotal(files, policy)) {
+                const specPath = gate.specPathOf(issue.body);
+                let approved = false;
+                if (specPath) {
+                  try {
+                    const { data } = await github.rest.repos.getContent({ owner, repo, path: specPath, ref: pr.base.repo.default_branch });
+                    approved = gate.specApproved(gate.decodeContent(data, specPath));
+                  } catch (e) { core.info(`spec ${specPath} not readable: ${e.status || e.message}`); }
+                }
+                issue.spec = { path: specPath, approved };
+              }
               // Approved copies: read only when every changed file is a listed path,
               // once per side per file, at the head and base SHAs (never a branch
               // name). A failed or unusable read is null: not an approved copy.
@@ -169,11 +183,13 @@ __GATE_JS__
                 `risk: ${result.risk} (${result.reasons.join('; ')})`, `review: ${result.review}`, `human-approved: ${result.approved}`,
                 ...(result.agentWhy ? [`kept out of risk:agent by: ${result.agentWhy}`] : []),
                 ...(result.risk === 'checked' ? [`in risk:checked because: ${result.reasons.join('; ')}`, `check of this commit: ${result.check || 'none yet'}`] : []),
+                ...(input.issue?.spec ? [`spec named by the linked issue: ${input.issue.spec.path || 'none'}${input.issue.spec.path ? (input.issue.spec.approved ? ' (approved on the default branch)' : ' (not approved on the default branch)') : ''}`] : []),
                 `ruling for this commit: ${result.ruling || 'none'}${result.settled ? ' (answered findings settled)' : ''}`,
               ]).write();
             }
             if (context.eventName === 'push') {
-              // The policy (.ops.yml) changed. Only a push to the default branch
+              // The policy (.ops.yml) or a spec (specs/**, read by the pivotal_spec_check trial, issue #31)
+              // changed. Only a push to the default branch
               // counts; re-evaluate every open PR under the new policy, whatever its
               // branch: pivotal_paths and sensitive_paths apply to every PR (issue #26).
               if (context.ref !== `refs/heads/${context.payload.repository?.default_branch}`) return;

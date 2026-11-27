@@ -10,7 +10,7 @@ A merge gate for repositories where AI coding agents open pull requests. It sets
 | `risk:low` | docs, added tests, Dependabot patch bumps, deletion-only dead-code removal, approved copies of shared files; never a PR that touches a `pivotal_paths` or `sensitive_paths` file (see below) | nothing more |
 | `risk:agent` | an agent PR that meets every agent-safe rule (opt-in per repo, see below) | nothing more |
 | `risk:checked` | an agent PR kept out of `risk:agent` **only** by its size, a `sensitive_paths` file, a deleted file, or a removed or skipped test (see below) | a `check-verdict` of `pass` for the head commit, or `human-approved` on it |
-| `risk:normal` | everything else, including any PR that touches a `pivotal_paths` file | the owner's `human-approved` label on this exact commit |
+| `risk:normal` | everything else, including any PR that touches a `pivotal_paths` file (except under the `pivotal_spec_check` trial, below) | the owner's `human-approved` label on this exact commit |
 
 The `.ops.yml` lists (on the default branch) apply before `risk:low` is decided, on both the old and new path of a rename. A PR that changes any `pivotal_paths` file is `risk:normal` whatever the file type, with the reason `pivotal path <name>`. A PR that changes any `sensitive_paths` file is never `risk:low`: it is `risk:checked` or `risk:normal` by the rules below. With no `.ops.yml`, or empty lists, nothing changes. Two cases are decided before the lists are read and are unchanged: approved copies (their content is approved by hash, and every listed copy is a protected path anyway) and Dependabot patch bumps of manifests.
 
@@ -56,6 +56,20 @@ The caller evaluates the gate when a comment carrying either marker is posted, e
 
 `<reason>` lists every rule that put the PR in the tier (shortened to fit 140 characters), and the job summary repeats it as `in risk:checked because: …`, with the check and ruling it read. "Review clean" means the same as for `risk:agent`: the review of the head commit is clear, or the owner overruled findings with `review:override`; or, from this tier, answered findings that a ruling settled (below). A Codex PR still needs its Claude second review.
 
+### Trial: a pivotal file whose issue names an approved spec (`pivotal_spec_check`)
+
+Off unless `.ops.yml` on the default branch says `pivotal_spec_check: true` (portfolio-ops decision 0017; issue #31). Where it is on, a `pivotal_paths` file becomes one more reason the checked tier accepts, but only when the issue the PR implements names a spec that is approved:
+
+- the spec is the first `specs/<name>.md` path in the linked issue's body (a path with a `..` segment names nothing);
+- the gate reads that file at the head of the **default branch**, never from the PR, and only when the PR changes a `pivotal_paths` file;
+- it is approved when the first `Status:` in the file is followed by the word `approved`. Missing, unreadable, draft or unnamed: not approved.
+
+Then the PR is `risk:checked` with the reason `pivotal path <name>`, and the check of its head commit decides it as for any other checked PR; the owner's `human-approved` still passes it. It is never `risk:low` or `risk:agent`. Every other rule holds as before: the branch and issue rules (open, queued, not labelled `pivotal`), protected paths (so a PR cannot approve its own spec: `specs/` is protected), dependency files, the bot review, and `checked_tier: false`. With the key absent or `false`, or with no approved spec, the PR is `risk:normal` exactly as before. A value other than `true` or `false` is unreadable and switches the agent-safe and checked tiers off.
+
+What it relies on: agents act with the owner's identity and can edit an issue's body, so an agent can point an issue at any approved spec. The gate proves only that the named spec is approved; whether the change is what that spec describes is the check session's judgement, with the audit of each checked merge behind it (below). **To turn it off:** remove the line or set `pivotal_spec_check: false`; the push of `.ops.yml` re-evaluates every open PR at once.
+
+The evidence is re-read when it changes: the caller also runs the gate when an issue's body is edited and names a spec before or after the edit (the PRs that implement that issue are re-evaluated), and on a default-branch push under `specs/` (every open PR is re-evaluated, as for `.ops.yml`). So a spec set back to draft, or an issue that stops naming it, withdraws a pass that has not merged yet. An issue edit that names no spec is skipped and starts no runner.
+
 **Off switch:** `checked_tier: false` in `.ops.yml` on the default branch turns the tier off for that repository; such PRs are `risk:normal` exactly as before. Absent means on, but only where `agent_safe: true`. Any other value (`no`, `"false"`, …) is unreadable and, like every unreadable line, switches the agent-safe tier off too. `.ops.yml` is read from the default branch only and is a protected path, so a PR cannot turn the tier on for itself.
 
 ### Rulings on answered findings
@@ -91,6 +105,7 @@ A PR that fails only the size, `sensitive_paths`, deleted-file or test rules is 
 agent_safe: true
 agent_max_lines: 400
 checked_tier: true     # default; false makes the PRs below risk:normal again
+pivotal_spec_check: false  # default; true is the trial above (a pivotal file whose issue names an approved spec goes to the check)
 sensitive_paths:       # risk:checked: need a passing check, or human-approved
   - "src/auth/**"
   - db/migrations/
