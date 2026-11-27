@@ -89,3 +89,8 @@ jobs:
       group: pr-gate-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: true
     uses: haynesj1/portfolio-gate/.github/workflows/gate.yml@main
+    # The repo variable GATE_RUNNER set to `gate-mac` runs the evaluation on the owner's
+    # self-hosted runner, which uses no Actions minutes. Unset (or any other value), it
+    # runs on GitHub's runner. Delete the variable to go back at once.
+    with:
+      runner: ${{ vars.GATE_RUNNER || 'ubuntu-24.04' }}

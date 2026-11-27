@@ -164,7 +164,33 @@ test('caller only uses triggers that run default-branch code, and calls the gate
   assert.ok(!caller.slice(0, caller.indexOf('\njobs:')).includes('concurrency:'), 'no workflow-level concurrency');
   // The reusable workflow can only be called, never triggered directly.
   const on2 = yml.slice(yml.indexOf('\non:'), yml.indexOf('\njobs:'));
-  assert.equal(on2.trim(), 'on:\n  workflow_call:');
+  assert.deepEqual(on2.split('\n').filter((l) => /^ {0,2}\S/.test(l)), ['on:', '  workflow_call:']);
+});
+
+// Where the gate runs (portfolio-ops decision 0015). Evaluated as the caller filter is: the real expressions, run as JavaScript.
+test('runner: only the exact value gate-mac moves the gate off GitHub\'s runner', () => {
+  const runsOn = /^    runs-on: \$\{\{ (.*) \}\}$/m.exec(yml)[1];
+  const pick = (runner) => new Function('inputs', `return (${runsOn});`)({ runner });
+  assert.equal(pick('gate-mac'), 'gate-mac');
+  for (const other of ['ubuntu-24.04', '', undefined, null, 'self-hosted', 'Gate-Mac', 'gate-mac ', 'macos-latest', 'gate-mac-2']) assert.equal(pick(other), 'ubuntu-24.04', String(other));
+  // One optional string input with a hosted default, so a caller that passes nothing still runs.
+  const inputs = yml.slice(yml.indexOf('    inputs:'), yml.indexOf('\njobs:'));
+  assert.match(inputs, /\n      runner:\n        type: string\n        required: false\n        default: ubuntu-24\.04\n/);
+  assert.equal((inputs.match(/^      \w+:$/gm) || []).length, 1);
+  // Nothing else in the workflow chooses a runner.
+  assert.equal((yml.match(/^\s*runs-on:/gm) || []).length, 1);
+});
+
+test('caller: passes the repo variable GATE_RUNNER, and GitHub\'s runner when it is unset', () => {
+  const callerYml = fs.readFileSync(path.join(__dirname, '..', 'caller', 'pr-gate.yml'), 'utf8');
+  const expr = /^      runner: \$\{\{ (.*) \}\}$/m.exec(callerYml)[1];
+  const pass = (vars) => new Function('vars', `return (${expr.replace(/vars\./g, 'vars?.')});`)(vars);
+  assert.equal(pass({ GATE_RUNNER: 'gate-mac' }), 'gate-mac');
+  for (const vars of [{}, { GATE_RUNNER: '' }, { GATE_RUNNER: null }]) assert.equal(pass(vars), 'ubuntu-24.04');
+  // `with` belongs to the job that calls the gate, right after `uses`.
+  assert.match(callerYml, /\n    uses: haynesj1\/portfolio-gate\/\.github\/workflows\/gate\.yml@main\n(?:    #.*\n)*    with:\n      runner: /);
+  // This repo's own caller is the same file.
+  assert.equal(fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'pr-gate.yml'), 'utf8'), callerYml);
 });
 
 // The caller's job-level `if` decides which comment events evaluate the gate. Evaluate

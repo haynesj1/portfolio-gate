@@ -125,6 +125,17 @@ node -p "require('./gate/gate').copyHash(require('fs').readFileSync('path/to/fil
 
 **Off switch:** with no entries (`{ "files": [], "blocks": [] }`, so no caller entry either) the gate reads nothing and behaves exactly as it did before approved copies.
 
+## Where the gate runs
+
+The gate's job takes about ten seconds, and GitHub bills each job in a private repository as a whole minute. A repository can run it on the owner's own (self-hosted) runner instead, which uses no Actions minutes:
+
+- The caller passes its repository variable `GATE_RUNNER` as the `runner` input.
+- Only the exact value `gate-mac` is honoured: the job then runs on a runner with that label. Any other value, or no variable, runs on GitHub's runner as before.
+- To go back, delete the variable. The next gate run is on GitHub's runner.
+- While the self-hosted runner is offline, gate runs wait in the queue (GitHub cancels a queued job after 24 hours), so nothing passes and nothing merges: it fails closed.
+
+Nothing about the evidence changes. The job never checks out PR code, and it posts with the calling repository's own `GITHUB_TOKEN`, so the status still comes from GitHub Actions. The runner must run under an account that agents cannot read, because that token is on the machine while the job runs.
+
 ## Why it looks the way it does
 
 The agents act with the owner's GitHub identity: they can push, comment, label and post commit statuses as the owner. So the gate trusts only evidence an agent can't forge:
